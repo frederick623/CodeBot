@@ -1,47 +1,66 @@
+//! In-process embedding + reranking.
+//!
+//! Inference runs inside the daemon via `fastembed` (ONNX Runtime); there is no
+//! separate microservice. Model weights are fetched from Hugging Face on first
+//! use and cached locally. The public API is unchanged from the previous HTTP
+//! client so `retrieval` and `indexer` need no edits.
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
+use fastembed::{
+    EmbeddingModel, RerankInitOptions, RerankerModel, TextEmbedding, TextInitOptions, TextRerank,
+};
+use parking_lot::Mutex;
+
+const EMBED_BATCH: usize = 32;
+
+// fastembed's inference methods take `&mut self`, so the shared models live
+// behind a Mutex. Calls run inside `spawn_blocking`, so holding the (non-async)
+// lock across the synchronous inference is fine.
 #[derive(Clone)]
 pub struct EmbedClient {
-    base: String,
-    http: reqwest::Client,
+    embed: Arc<Mutex<TextEmbedding>>,
+    rerank: Arc<Mutex<TextRerank>>,
 }
 
-#[derive(Serialize)]
-struct EmbedReq<'a> { inputs: &'a [String], normalize: bool }
-#[derive(Deserialize)]
-struct EmbedResp { vectors: Vec<Vec<f32>> }
-
-#[derive(Serialize)]
-struct RerankReq<'a> { query: &'a str, documents: &'a [String], top_k: Option<usize> }
-#[derive(Deserialize)]
 pub struct RerankItem { pub index: usize, pub score: f32 }
-#[derive(Deserialize)]
-struct RerankResp { results: Vec<RerankItem> }
 
 impl EmbedClient {
-    pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: reqwest::Client::new() }
+    /// Load both models. This blocks while weights are downloaded/loaded, so it
+    /// is called once during daemon startup.
+    pub fn new() -> Result<Self> {
+        let embed = TextEmbedding::try_new(TextInitOptions::new(EmbeddingModel::BGESmallENV15))?;
+        let rerank = TextRerank::try_new(RerankInitOptions::new(RerankerModel::BGERerankerBase))?;
+        Ok(Self {
+            embed: Arc::new(Mutex::new(embed)),
+            rerank: Arc::new(Mutex::new(rerank)),
+        })
     }
 
     pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        let r: EmbedResp = self
-            .http
-            .post(format!("{}/embed", self.base))
-            .json(&EmbedReq { inputs, normalize: true })
-            .send().await?.error_for_status()?
-            .json().await?;
-        Ok(r.vectors)
+        let model = self.embed.clone();
+        let docs: Vec<String> = inputs.to_vec();
+        // CPU-bound inference: keep it off the async runtime's worker threads.
+        let vecs = tokio::task::spawn_blocking(move || model.lock().embed(docs, Some(EMBED_BATCH)))
+            .await??;
+        Ok(vecs)
     }
 
     pub async fn rerank(&self, query: &str, docs: &[String], top_k: usize)
         -> Result<Vec<RerankItem>> {
-        let r: RerankResp = self
-            .http
-            .post(format!("{}/rerank", self.base))
-            .json(&RerankReq { query, documents: docs, top_k: Some(top_k) })
-            .send().await?.error_for_status()?
-            .json().await?;
-        Ok(r.results)
+        let model = self.rerank.clone();
+        let query = query.to_string();
+        let documents: Vec<String> = docs.to_vec();
+        let items = tokio::task::spawn_blocking(move || -> Result<Vec<RerankItem>> {
+            // fastembed returns results sorted by descending relevance score.
+            let results = model.lock().rerank(query, documents, false, None)?;
+            Ok(results
+                .into_iter()
+                .take(top_k)
+                .map(|r| RerankItem { index: r.index, score: r.score })
+                .collect())
+        })
+        .await??;
+        Ok(items)
     }
 }

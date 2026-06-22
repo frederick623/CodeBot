@@ -85,7 +85,7 @@ impl Indexer {
             }
         }
 
-        // Insert chunks, then batch-embed via the Python service.
+        // Insert chunks, then batch-embed them in-process.
         let mut chunk_ids = Vec::new();
         let mut payloads = Vec::new();
         for ch in &chunks {

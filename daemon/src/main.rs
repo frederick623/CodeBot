@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().json().with_env_filter("info").init();
 
     let store = Store::open(&PathBuf::from(".assistant.db"))?;
-    let embed = EmbedClient::new("http://127.0.0.1:8088");
+    let embed = EmbedClient::new()?; // loads embedding + rerank models in-process
     let llm = LlmClient::new("http://127.0.0.1:11434", "qwen2.5-coder:7b"); // any OpenAI-compatible server
     let retriever = Arc::new(Retriever::new(store.clone(), embed.clone()));
     let indexer = Arc::new(Indexer::new(store.clone(), embed.clone()));
