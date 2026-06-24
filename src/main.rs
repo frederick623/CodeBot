@@ -45,9 +45,9 @@ async fn main() -> Result<()> {
     // Any OpenAI-compatible server. Overridable via env so the daemon can point
     // at a different host/model without recompiling.
     let llm_base = std::env::var("CODEBOT_LLM_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
     let llm_model = std::env::var("CODEBOT_LLM_MODEL")
-        .unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
+        .unwrap_or_else(|_| "gpt-oss-20b-mxfp4-q8".to_string());
     tracing::info!(%llm_base, %llm_model, "llm configured");
     let llm = LlmClient::new(llm_base, llm_model);
     let retriever = Arc::new(Retriever::new(store.clone(), embed.clone()));
@@ -184,10 +184,11 @@ async fn plan(State(st): State<AppState>, Json(req): Json<PlanReq>) -> Json<Plan
     }
 }
 
-/// Deterministic name-registry verification. Parses the candidate `code` with
-/// tree-sitter and checks every function definition against the frozen registry
-/// for `plan_id`, returning violations and an auto-corrected source where the
-/// only fault was casing/style. Unknown language or empty registry → no-op pass.
+/// Deterministic verification cascade. Parses the candidate `code` with
+/// tree-sitter and runs the composed gate (parse → names → references) against
+/// the frozen registry for `plan_id`, returning the failing stage and its
+/// violations plus a fully auto-corrected source where every fault was
+/// deterministically fixable. Unknown language or empty registry → no-op pass.
 async fn verify(State(st): State<AppState>, Json(req): Json<VerifyReq>) -> Json<VerifyResp> {
     let trace_id = Uuid::new_v4().to_string();
     let registry: Vec<String> = st
@@ -199,17 +200,30 @@ async fn verify(State(st): State<AppState>, Json(req): Json<VerifyReq>) -> Json<
         .collect();
 
     let report = match detect_lang(Path::new(&req.path)) {
-        Some(lang) if !registry.is_empty() => verifier::verify_names(&req.code, lang, &registry),
-        _ => verifier::VerifyReport { ok: true, violations: vec![], corrected: None },
+        Some(lang) if !registry.is_empty() => verifier::run_cascade(&req.code, lang, &registry),
+        _ => verifier::CascadeReport {
+            ok: true,
+            stage: None,
+            violations: vec![],
+            fixes: vec![],
+            corrected: None,
+        },
     };
 
     Json(VerifyResp {
         ok: report.ok,
+        stage: report.stage,
         violations: report
             .violations
             .into_iter()
-            .map(|v| NameViolationDto { found: v.found, line: v.line, suggestion: v.suggestion })
+            .map(|v| ViolationDto {
+                checker: v.checker,
+                message: v.message,
+                line: v.line,
+                suggestion: v.suggestion,
+            })
             .collect(),
+        fixes: report.fixes,
         corrected: report.corrected,
         trace_id,
     })

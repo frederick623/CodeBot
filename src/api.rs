@@ -69,18 +69,25 @@ pub struct VerifyReq {
 }
 
 #[derive(Debug, Serialize)]
-pub struct NameViolationDto {
-    pub found: String,
+pub struct ViolationDto {
+    /// The cascade stage that produced this violation (e.g. "parse", "names").
+    pub checker: String,
+    /// Human-readable description of the fault.
+    pub message: String,
     pub line: usize,
-    /// Canonical name to rename to, when the only fault was casing/style.
+    /// Canonical target to rename to, when the fault is deterministically fixable.
     pub suggestion: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct VerifyResp {
     pub ok: bool,
-    pub violations: Vec<NameViolationDto>,
-    /// Source with auto-correctable renames applied; null if nothing changed.
+    /// The failing cascade stage when `ok` is false; null when the code passed.
+    pub stage: Option<String>,
+    pub violations: Vec<ViolationDto>,
+    /// Deterministic corrections the cascade applied, for transparency.
+    pub fixes: Vec<String>,
+    /// Source with all deterministic corrections applied; null if unchanged.
     pub corrected: Option<String>,
     pub trace_id: String,
 }

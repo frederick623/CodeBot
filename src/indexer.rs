@@ -327,6 +327,96 @@ pub fn defined_names(content: &str, lang: Lang) -> Vec<NameSpan> {
     out
 }
 
+/// Lines (1-based) carrying an ERROR or MISSING node — the cheapest cascade
+/// gate. An empty result means the candidate parses clean under the grammar.
+/// A failed parse (no tree at all) is reported as a single error at line 1.
+pub fn syntax_errors(content: &str, lang: Lang) -> Vec<usize> {
+    let language = language_for(lang);
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return vec![];
+    }
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return vec![1],
+    };
+    let root = tree.root_node();
+    if !root.has_error() {
+        return vec![];
+    }
+    // DFS, descending only into subtrees that actually contain an error so we
+    // surface the shallowest offending positions without walking the whole AST.
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            out.push(node.start_position().row + 1);
+            continue;
+        }
+        let mut i = 0;
+        while i < node.child_count() {
+            if let Some(c) = node.child(i) {
+                if c.has_error() {
+                    stack.push(c);
+                }
+            }
+            i += 1;
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Byte-accurate spans of every call-site callee identifier, reusing the same
+/// per-language call queries as the code-graph extractor. Lets the reference
+/// gate rewrite a drifted callee in place.
+pub fn called_names(content: &str, lang: Lang) -> Vec<NameSpan> {
+    capture_spans(content, lang, call_queries(lang), "callee")
+}
+
+/// Like `capture_query` but returns byte-accurate `NameSpan`s (with the capture
+/// name recorded as `kind`) so callers can splice in-place corrections.
+fn capture_spans(content: &str, lang: Lang, queries: &[&str], cap: &str) -> Vec<NameSpan> {
+    let language = language_for(lang);
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return vec![];
+    }
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+    for qsrc in queries {
+        let query = match Query::new(&language, qsrc) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+        let cap_idx = match query.capture_index_for_name(cap) {
+            Some(i) => i,
+            None => continue,
+        };
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+        while let Some(m) = matches.next() {
+            for c in m.captures {
+                if c.index == cap_idx {
+                    out.push(NameSpan {
+                        text: c.node.utf8_text(bytes).unwrap_or("").to_string(),
+                        start_byte: c.node.start_byte(),
+                        end_byte: c.node.end_byte(),
+                        line: c.node.start_position().row + 1,
+                        kind: cap.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Map a language to its tree-sitter grammar. These grammar crate versions all
 /// expose a `language()`-style fn returning `Language`.
 fn language_for(lang: Lang) -> tree_sitter::Language {

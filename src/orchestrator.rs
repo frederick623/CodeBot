@@ -1,7 +1,7 @@
 use crate::indexer::{detect_lang, Lang};
 use crate::llm::LlmClient;
 use crate::storage::{PlanSymbol, Store, TaskRow};
-use crate::verifier::{verify_names, VerifyReport};
+use crate::verifier::{run_cascade, CascadeReport};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -167,11 +167,17 @@ impl Orchestrator {
             last_code = Some(code.clone());
 
             self.store.set_task_status(task.id, "verifying")?;
-            // No language detected or empty registry → the AST gate cannot fire;
+            // No language detected or empty registry → the cascade cannot fire;
             // accept verbatim rather than block on a check we cannot run.
             let report = match lang {
-                Some(l) if !registry.is_empty() => verify_names(&code, l, registry),
-                _ => VerifyReport { ok: true, violations: vec![], corrected: None },
+                Some(l) if !registry.is_empty() => run_cascade(&code, l, registry),
+                _ => CascadeReport {
+                    ok: true,
+                    stage: None,
+                    violations: vec![],
+                    fixes: vec![],
+                    corrected: None,
+                },
             };
 
             match resolve(&report) {
@@ -187,19 +193,10 @@ impl Orchestrator {
                     });
                 }
                 Resolution::AutoCorrect(fixed) => {
-                    // Record what was laundered so the history stays honest, then
-                    // accept the deterministically corrected source.
-                    for v in &report.violations {
-                        self.store.log_error(
-                            task.id,
-                            attempt,
-                            "names",
-                            &format!(
-                                "auto-corrected `{}` -> `{}`",
-                                v.found,
-                                v.suggestion.as_deref().unwrap_or("")
-                            ),
-                        )?;
+                    // Record every deterministic correction so the history stays
+                    // honest, then accept the canonicalized source.
+                    for f in &report.fixes {
+                        self.store.log_error(task.id, attempt, "cascade", f)?;
                     }
                     self.store.save_task_code(task.id, &fixed)?;
                     self.store.set_task_status(task.id, "verified")?;
@@ -213,18 +210,10 @@ impl Orchestrator {
                 }
                 Resolution::Retry => {
                     self.store.save_task_code(task.id, &code)?; // keep last attempt
-                    last_violations = report
-                        .violations
-                        .iter()
-                        .map(|v| format!("`{}` is not in the interface registry", v.found))
-                        .collect();
+                    last_violations =
+                        report.violations.iter().map(|v| v.message.clone()).collect();
                     for v in &report.violations {
-                        self.store.log_error(
-                            task.id,
-                            attempt,
-                            "names",
-                            &format!("`{}` at line {} is not a planned symbol", v.found, v.line),
-                        )?;
+                        self.store.log_error(task.id, attempt, &v.checker, &v.message)?;
                     }
                 }
             }
@@ -370,29 +359,29 @@ pub struct TaskOutcome {
     pub violations: Vec<String>,
 }
 
-/// The decision derived purely from a `VerifyReport`. Factored out of the loop so
-/// the retry policy is unit-testable without an LLM: the model never decides
-/// whether code is acceptable — this function (over the checker's output) does.
+/// The decision derived purely from a `CascadeReport`. Factored out of the loop
+/// so the retry policy is unit-testable without an LLM: the model never decides
+/// whether code is acceptable — this function (over the cascade's verdict) does.
+/// The cascade already applied every deterministic correction it could, so the
+/// mapping is direct.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Resolution {
-    /// No violations: the candidate passed the gate as-is.
+    /// Passed with no corrections needed.
     Clean,
-    /// Every violation has a deterministic fix; accept the corrected source
+    /// Passed only after deterministic corrections; accept the fixed source
     /// without consulting the model again.
     AutoCorrect(String),
-    /// At least one violation has no fix; the model must try again.
+    /// An unfixable violation remains; the model must try again.
     Retry,
 }
 
-pub(crate) fn resolve(report: &VerifyReport) -> Resolution {
-    if report.ok {
-        return Resolution::Clean;
+pub(crate) fn resolve(report: &CascadeReport) -> Resolution {
+    if !report.ok {
+        return Resolution::Retry;
     }
     match &report.corrected {
-        Some(fixed) if report.violations.iter().all(|v| v.suggestion.is_some()) => {
-            Resolution::AutoCorrect(fixed.clone())
-        }
-        _ => Resolution::Retry,
+        Some(fixed) => Resolution::AutoCorrect(fixed.clone()),
+        None => Resolution::Clean,
     }
 }
 
@@ -436,38 +425,125 @@ fn build_impl_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verifier::NameViolation;
+    use crate::verifier::CascadeViolation;
 
-    fn report(ok: bool, violations: Vec<NameViolation>, corrected: Option<&str>) -> VerifyReport {
-        VerifyReport { ok, violations, corrected: corrected.map(|s| s.to_string()) }
+    fn report(ok: bool, corrected: Option<&str>, violations: Vec<CascadeViolation>) -> CascadeReport {
+        CascadeReport {
+            ok,
+            stage: if ok { None } else { Some("names".to_string()) },
+            violations,
+            fixes: vec![],
+            corrected: corrected.map(|s| s.to_string()),
+        }
     }
 
     #[test]
     fn clean_report_resolves_clean() {
-        assert_eq!(resolve(&report(true, vec![], None)), Resolution::Clean);
+        assert_eq!(resolve(&report(true, None, vec![])), Resolution::Clean);
     }
 
     #[test]
-    fn all_fixable_resolves_autocorrect() {
-        let v = NameViolation {
-            found: "verifyToken".to_string(),
-            line: 1,
-            suggestion: Some("verify_token".to_string()),
-        };
-        let r = report(false, vec![v], Some("fn verify_token() {}"));
+    fn corrected_report_resolves_autocorrect() {
+        // The cascade already applied fixes and passed; `corrected` is present.
+        let r = report(true, Some("fn verify_token() {}"), vec![]);
         assert_eq!(resolve(&r), Resolution::AutoCorrect("fn verify_token() {}".to_string()));
     }
 
     #[test]
-    fn any_unfixable_resolves_retry() {
-        let fixable = NameViolation {
-            found: "verifyToken".to_string(),
+    fn failed_report_resolves_retry() {
+        let v = CascadeViolation {
+            checker: "names".to_string(),
+            message: "`helper` is not a planned symbol".to_string(),
             line: 1,
-            suggestion: Some("verify_token".to_string()),
+            suggestion: None,
         };
-        let invented = NameViolation { found: "helper".to_string(), line: 2, suggestion: None };
-        // Even with a `corrected` present, one unfixable violation forces a retry.
-        let r = report(false, vec![fixable, invented], Some("partially fixed"));
-        assert_eq!(resolve(&r), Resolution::Retry);
+        assert_eq!(resolve(&report(false, None, vec![v])), Resolution::Retry);
+    }
+
+    // --- Loop integration tests (mock OpenAI-compatible server, in-memory DB) ---
+
+    /// Spawn a minimal `/v1/chat/completions` server that always returns
+    /// `content` as the assistant message. Returns its base URL.
+    async fn spawn_mock(content: String) -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let c = content.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "choices": [{ "message": { "content": c } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    /// In-memory store with one frozen function symbol `verify_token`.
+    fn seed_store() -> (Store, String) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let plan_id = "plan-test".to_string();
+        store
+            .freeze_plan(
+                &plan_id,
+                &[PlanSymbol {
+                    module: "auth".to_string(),
+                    name: "verify_token".to_string(),
+                    kind: "function".to_string(),
+                    signature: "verify_token(token: String) -> bool".to_string(),
+                }],
+            )
+            .unwrap();
+        (store, plan_id)
+    }
+
+    #[tokio::test]
+    async fn exact_name_reaches_verified_in_one_attempt() {
+        let (store, plan_id) = seed_store();
+        let base = spawn_mock("fn verify_token(token: String) -> bool { true }".to_string()).await;
+        let orch = Orchestrator::new(store.clone(), LlmClient::new(base, "mock"));
+
+        let outcomes = orch.implement(&plan_id, "auth.rs", 3).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, "verified");
+        assert_eq!(outcomes[0].attempts, 1);
+        // The store, not the model, records the terminal state.
+        assert_eq!(store.get_tasks(&plan_id).unwrap()[0].status, "verified");
+    }
+
+    #[tokio::test]
+    async fn casing_drift_is_auto_corrected_to_verified() {
+        let (store, plan_id) = seed_store();
+        // camelCase name: normalizes onto the registry, so the gate auto-fixes it.
+        let base = spawn_mock("fn verifyToken(token: String) -> bool { true }".to_string()).await;
+        let orch = Orchestrator::new(store.clone(), LlmClient::new(base, "mock"));
+
+        let outcomes = orch.implement(&plan_id, "auth.rs", 3).await.unwrap();
+        assert_eq!(outcomes[0].status, "verified");
+        let code = outcomes[0].code.as_deref().unwrap();
+        assert!(code.contains("verify_token"));
+        assert!(!code.contains("verifyToken"));
+    }
+
+    #[tokio::test]
+    async fn invented_name_fails_after_exhausting_budget() {
+        let (store, plan_id) = seed_store();
+        // An invented symbol has no deterministic fix → retried then failed.
+        let base = spawn_mock("fn helper() {}".to_string()).await;
+        let orch = Orchestrator::new(store.clone(), LlmClient::new(base, "mock"));
+
+        let outcomes = orch.implement(&plan_id, "auth.rs", 3).await.unwrap();
+        assert_eq!(outcomes[0].status, "failed");
+        assert_eq!(outcomes[0].attempts, 3);
+        assert!(!outcomes[0].violations.is_empty());
+        // Every attempt's failure is durably logged as the correction signal.
+        let task_id = store.get_tasks(&plan_id).unwrap()[0].id;
+        assert!(store.get_error_history(task_id).unwrap().len() >= 3);
     }
 }
