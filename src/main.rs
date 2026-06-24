@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
         .route("/chat", post(chat))
         .route("/plan", post(plan))
         .route("/verify", post(verify))
+        .route("/implement", post(implement))
         .route("/index/status", get(index_status))
         .with_state(state);
 
@@ -212,6 +213,38 @@ async fn verify(State(st): State<AppState>, Json(req): Json<VerifyReq>) -> Json<
         corrected: report.corrected,
         trace_id,
     })
+}
+
+/// Execution loop: drive every pending task for a plan through
+/// generate→verify→retry. Verification (the AST name gate) is the gate; the
+/// store owns task state, so `verified` is only reached when a deterministic
+/// checker passes. Returns the terminal state of each task that was processed.
+async fn implement(State(st): State<AppState>, Json(req): Json<ImplementReq>) -> Json<ImplementResp> {
+    let trace_id = Uuid::new_v4().to_string();
+    tracing::info!(trace_id, plan_id = %req.plan_id, "implement request");
+
+    let tasks = match st
+        .orchestrator
+        .implement(&req.plan_id, &req.path, req.max_attempts)
+        .await
+    {
+        Ok(outcomes) => outcomes
+            .into_iter()
+            .map(|o| TaskOutcomeDto {
+                name: o.name,
+                status: o.status,
+                attempts: o.attempts,
+                code: o.code,
+                violations: o.violations,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::error!(trace_id, "implement error: {e}");
+            vec![]
+        }
+    };
+
+    Json(ImplementResp { plan_id: req.plan_id, tasks, trace_id })
 }
 
 async fn index_status(State(st): State<AppState>) -> Json<IndexStatus> {

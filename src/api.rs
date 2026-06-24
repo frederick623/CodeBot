@@ -85,6 +85,38 @@ pub struct VerifyResp {
     pub trace_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImplementReq {
+    pub plan_id: String,
+    /// File path; used only to detect the target language by extension.
+    pub path: String,
+    /// Retry budget per task. Defaults to 3 when omitted.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskOutcomeDto {
+    pub name: String,
+    /// Terminal status: `verified` or `failed`.
+    pub status: String,
+    pub attempts: i64,
+    pub code: Option<String>,
+    /// Unresolved violations when `failed`; empty when verified.
+    pub violations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImplementResp {
+    pub plan_id: String,
+    pub tasks: Vec<TaskOutcomeDto>,
+    pub trace_id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IndexStatus {
     pub files: usize,

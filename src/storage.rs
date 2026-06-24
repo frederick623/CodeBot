@@ -52,6 +52,19 @@ pub struct PlanSymbol {
     pub signature: String,
 }
 
+/// A unit of implementation work with an explicit lifecycle. The store, not the
+/// model, owns the truth about what exists and whether it is verified.
+/// `status` is one of: pending | generating | verifying | verified | failed.
+#[derive(Debug, Clone)]
+pub struct TaskRow {
+    pub id: i64,
+    pub plan_id: String,
+    pub name: String,
+    pub status: String,
+    pub code: Option<String>,
+    pub attempts: i64,
+}
+
 impl Store {
     pub fn open(db_path: &Path) -> Result<Self> {
         register_sqlite_vec(); // must run before the connection is opened
@@ -106,7 +119,27 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_symbol);
+            CREATE TABLE IF NOT EXISTS tasks (
+                id        INTEGER PRIMARY KEY,
+                plan_id   TEXT NOT NULL,
+                name      TEXT NOT NULL,
+                status    TEXT NOT NULL,
+                code      TEXT,
+                attempts  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(plan_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS errors (
+                id        INTEGER PRIMARY KEY,
+                task_id   INTEGER NOT NULL,
+                attempt   INTEGER NOT NULL,
+                checker   TEXT NOT NULL,
+                message   TEXT NOT NULL,
+                resolved  INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_plan_symbols_plan ON plan_symbols(plan_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id);
+            CREATE INDEX IF NOT EXISTS idx_errors_task ON errors(task_id);
             "#,
         )?;
         // The durable embedding store is the `embeddings` BLOB table above. When
@@ -402,6 +435,99 @@ impl Store {
                 kind: row.get(2)?,
                 signature: row.get(3)?,
             })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Seed one `pending` task per planned symbol. Idempotent: `INSERT OR IGNORE`
+    /// against `UNIQUE(plan_id,name)` leaves existing tasks (and their progress)
+    /// untouched on a re-run.
+    pub fn create_tasks(&self, plan_id: &str, names: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for name in names {
+            tx.execute(
+                "INSERT OR IGNORE INTO tasks(plan_id,name,status,attempts)
+                 VALUES(?1,?2,'pending',0)",
+                params![plan_id, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_tasks(&self, plan_id: &str) -> Result<Vec<TaskRow>> {
+        self.query_tasks(plan_id, Some("pending"))
+    }
+
+    pub fn get_tasks(&self, plan_id: &str) -> Result<Vec<TaskRow>> {
+        self.query_tasks(plan_id, None)
+    }
+
+    fn query_tasks(&self, plan_id: &str, status: Option<&str>) -> Result<Vec<TaskRow>> {
+        let conn = self.conn.lock();
+        let sql = match status {
+            Some(_) => "SELECT id,plan_id,name,status,code,attempts FROM tasks
+                        WHERE plan_id=?1 AND status=?2 ORDER BY id",
+            None => "SELECT id,plan_id,name,status,code,attempts FROM tasks
+                     WHERE plan_id=?1 ORDER BY id",
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map = |row: &rusqlite::Row| {
+            Ok(TaskRow {
+                id: row.get(0)?,
+                plan_id: row.get(1)?,
+                name: row.get(2)?,
+                status: row.get(3)?,
+                code: row.get(4)?,
+                attempts: row.get(5)?,
+            })
+        };
+        let rows = match status {
+            Some(s) => stmt.query_map(params![plan_id, s], map)?.collect::<Vec<_>>(),
+            None => stmt.query_map(params![plan_id], map)?.collect::<Vec<_>>(),
+        };
+        Ok(rows.into_iter().filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn set_task_status(&self, id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE tasks SET status=?2 WHERE id=?1", params![id, status])?;
+        Ok(())
+    }
+
+    pub fn save_task_code(&self, id: i64, code: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE tasks SET code=?2 WHERE id=?1", params![id, code])?;
+        Ok(())
+    }
+
+    pub fn bump_attempt(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE tasks SET attempts=attempts+1 WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Append a checker failure. The error log is never overwritten, so each
+    /// retry can be shown every prior attempt and exactly why it failed.
+    pub fn log_error(&self, task_id: i64, attempt: i64, checker: &str, message: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO errors(task_id,attempt,checker,message) VALUES(?1,?2,?3,?4)",
+            params![task_id, attempt, checker, message],
+        )?;
+        Ok(())
+    }
+
+    /// Full failure history for a task as (attempt, checker, message), oldest
+    /// first — the correction signal fed back into the next generation.
+    pub fn get_error_history(&self, task_id: i64) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT attempt,checker,message FROM errors WHERE task_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }

@@ -1,8 +1,11 @@
+use crate::indexer::{detect_lang, Lang};
 use crate::llm::LlmClient;
-use crate::storage::{PlanSymbol, Store};
+use crate::storage::{PlanSymbol, Store, TaskRow};
+use crate::verifier::{verify_names, VerifyReport};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::Path;
 use uuid::Uuid;
 
 /// Interface-first planning gate. The model is allowed exactly one thing here:
@@ -94,6 +97,147 @@ impl Orchestrator {
             .collect();
 
         Ok(PlanOutcome { plan_id, spec, frozen_names })
+    }
+
+    /// Drive every pending task for a plan through the generate→verify→retry
+    /// loop. `path` supplies the target language by extension; the frozen
+    /// registry is the gate. The store, not the model, decides what counts as
+    /// done: a task only reaches `verified` once a deterministic checker passes.
+    pub async fn implement(
+        &self,
+        plan_id: &str,
+        path: &str,
+        max_attempts: u32,
+    ) -> Result<Vec<TaskOutcome>> {
+        let symbols = self.store.get_plan_symbols(plan_id)?;
+        let registry: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+        let lang = detect_lang(Path::new(path));
+
+        // Seed one pending task per planned symbol (idempotent).
+        self.store.create_tasks(plan_id, &registry)?;
+
+        let mut outcomes = Vec::new();
+        for task in self.store.pending_tasks(plan_id)? {
+            outcomes.push(
+                self.implement_task(&task, &registry, &symbols, lang, max_attempts)
+                    .await?,
+            );
+        }
+        Ok(outcomes)
+    }
+
+    /// One task's bounded loop. Each attempt: bump the counter, generate against
+    /// the frozen signature plus the full failure history, then gate on the AST
+    /// name checker. Auto-correctable drift is fixed deterministically and
+    /// accepted; an invented symbol forces another attempt with that failure fed
+    /// back. The retry budget is the only escape — exhausting it lands `failed`.
+    async fn implement_task(
+        &self,
+        task: &TaskRow,
+        registry: &[String],
+        symbols: &[PlanSymbol],
+        lang: Option<Lang>,
+        max_attempts: u32,
+    ) -> Result<TaskOutcome> {
+        let max_attempts = max_attempts.max(1);
+        let signature = symbols
+            .iter()
+            .find(|s| s.name == task.name)
+            .map(|s| s.signature.clone())
+            .unwrap_or_else(|| task.name.clone());
+
+        let mut last_violations: Vec<String> = Vec::new();
+        let mut last_code: Option<String> = None;
+        let mut attempt: i64 = 0;
+        while (attempt as u32) < max_attempts {
+            attempt += 1;
+            self.store.bump_attempt(task.id)?;
+            self.store.set_task_status(task.id, "generating")?;
+
+            let history = self.store.get_error_history(task.id)?;
+            let user = build_impl_prompt(&task.name, &signature, registry, &history);
+            let code = match self.llm.chat(IMPL_SYSTEM, &user).await {
+                Ok(raw) => strip_fences(&raw).to_string(),
+                Err(e) => {
+                    self.store.log_error(task.id, attempt, "llm", &e.to_string())?;
+                    last_violations = vec![format!("llm error: {e}")];
+                    continue;
+                }
+            };
+            last_code = Some(code.clone());
+
+            self.store.set_task_status(task.id, "verifying")?;
+            // No language detected or empty registry → the AST gate cannot fire;
+            // accept verbatim rather than block on a check we cannot run.
+            let report = match lang {
+                Some(l) if !registry.is_empty() => verify_names(&code, l, registry),
+                _ => VerifyReport { ok: true, violations: vec![], corrected: None },
+            };
+
+            match resolve(&report) {
+                Resolution::Clean => {
+                    self.store.save_task_code(task.id, &code)?;
+                    self.store.set_task_status(task.id, "verified")?;
+                    return Ok(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "verified".to_string(),
+                        attempts: attempt,
+                        code: Some(code),
+                        violations: vec![],
+                    });
+                }
+                Resolution::AutoCorrect(fixed) => {
+                    // Record what was laundered so the history stays honest, then
+                    // accept the deterministically corrected source.
+                    for v in &report.violations {
+                        self.store.log_error(
+                            task.id,
+                            attempt,
+                            "names",
+                            &format!(
+                                "auto-corrected `{}` -> `{}`",
+                                v.found,
+                                v.suggestion.as_deref().unwrap_or("")
+                            ),
+                        )?;
+                    }
+                    self.store.save_task_code(task.id, &fixed)?;
+                    self.store.set_task_status(task.id, "verified")?;
+                    return Ok(TaskOutcome {
+                        name: task.name.clone(),
+                        status: "verified".to_string(),
+                        attempts: attempt,
+                        code: Some(fixed),
+                        violations: vec![],
+                    });
+                }
+                Resolution::Retry => {
+                    self.store.save_task_code(task.id, &code)?; // keep last attempt
+                    last_violations = report
+                        .violations
+                        .iter()
+                        .map(|v| format!("`{}` is not in the interface registry", v.found))
+                        .collect();
+                    for v in &report.violations {
+                        self.store.log_error(
+                            task.id,
+                            attempt,
+                            "names",
+                            &format!("`{}` at line {} is not a planned symbol", v.found, v.line),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        self.store.set_task_status(task.id, "failed")?;
+        Ok(TaskOutcome {
+            name: task.name.clone(),
+            status: "failed".to_string(),
+            attempts: attempt,
+            code: last_code,
+            violations: last_violations,
+        })
     }
 }
 
@@ -213,4 +357,117 @@ fn strip_fences(s: &str) -> &str {
         .or_else(|| t.strip_prefix("```"))
         .unwrap_or(t);
     t.strip_suffix("```").unwrap_or(t).trim()
+}
+
+/// Final state of one task after its loop ran, for reporting back to the caller.
+pub struct TaskOutcome {
+    pub name: String,
+    /// Terminal status: `verified` or `failed`.
+    pub status: String,
+    pub attempts: i64,
+    pub code: Option<String>,
+    /// Human-readable unresolved violations when `failed`; empty when verified.
+    pub violations: Vec<String>,
+}
+
+/// The decision derived purely from a `VerifyReport`. Factored out of the loop so
+/// the retry policy is unit-testable without an LLM: the model never decides
+/// whether code is acceptable — this function (over the checker's output) does.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Resolution {
+    /// No violations: the candidate passed the gate as-is.
+    Clean,
+    /// Every violation has a deterministic fix; accept the corrected source
+    /// without consulting the model again.
+    AutoCorrect(String),
+    /// At least one violation has no fix; the model must try again.
+    Retry,
+}
+
+pub(crate) fn resolve(report: &VerifyReport) -> Resolution {
+    if report.ok {
+        return Resolution::Clean;
+    }
+    match &report.corrected {
+        Some(fixed) if report.violations.iter().all(|v| v.suggestion.is_some()) => {
+            Resolution::AutoCorrect(fixed.clone())
+        }
+        _ => Resolution::Retry,
+    }
+}
+
+const IMPL_SYSTEM: &str = r#"You are the implementation stage of a code assistant.
+
+You are given exactly ONE function to implement. Its name and signature are FIXED:
+they were decided by the planning stage and frozen. You MUST keep them verbatim.
+
+RULES (non-negotiable):
+- Emit ONLY the function definition. No prose, no explanation, no markdown fences.
+- When calling other planned functions, use ONLY names from "INTERFACE REGISTRY".
+  Never invent a new name for a planned symbol.
+- If "PRIOR FAILED ATTEMPTS" is present, your previous output was rejected by a
+  deterministic checker. Fix exactly those problems."#;
+
+/// Assemble the implementation prompt: the frozen signature, the valid name set,
+/// and the full failure history (the correction signal that makes each retry
+/// strictly more informed than the last).
+fn build_impl_prompt(
+    name: &str,
+    signature: &str,
+    registry: &[String],
+    history: &[(i64, String, String)],
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("FUNCTION TO IMPLEMENT:\n{}\n\n", signature));
+    s.push_str(&format!(
+        "INTERFACE REGISTRY (the only valid function names):\n{}\n",
+        registry.join("\n")
+    ));
+    if !history.is_empty() {
+        s.push_str("\nPRIOR FAILED ATTEMPTS — fix these exact problems:\n");
+        for (att, checker, msg) in history {
+            s.push_str(&format!("- [attempt {att}] {checker}: {msg}\n"));
+        }
+    }
+    s.push_str(&format!("\nImplement `{}` now.", name));
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verifier::NameViolation;
+
+    fn report(ok: bool, violations: Vec<NameViolation>, corrected: Option<&str>) -> VerifyReport {
+        VerifyReport { ok, violations, corrected: corrected.map(|s| s.to_string()) }
+    }
+
+    #[test]
+    fn clean_report_resolves_clean() {
+        assert_eq!(resolve(&report(true, vec![], None)), Resolution::Clean);
+    }
+
+    #[test]
+    fn all_fixable_resolves_autocorrect() {
+        let v = NameViolation {
+            found: "verifyToken".to_string(),
+            line: 1,
+            suggestion: Some("verify_token".to_string()),
+        };
+        let r = report(false, vec![v], Some("fn verify_token() {}"));
+        assert_eq!(resolve(&r), Resolution::AutoCorrect("fn verify_token() {}".to_string()));
+    }
+
+    #[test]
+    fn any_unfixable_resolves_retry() {
+        let fixable = NameViolation {
+            found: "verifyToken".to_string(),
+            line: 1,
+            suggestion: Some("verify_token".to_string()),
+        };
+        let invented = NameViolation { found: "helper".to_string(), line: 2, suggestion: None };
+        // Even with a `corrected` present, one unfixable violation forces a retry.
+        let r = report(false, vec![fixable, invented], Some("partially fixed"));
+        assert_eq!(resolve(&r), Resolution::Retry);
+    }
 }
