@@ -43,6 +43,23 @@ pub struct ChatResp {
     pub trace_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PlanReq {
+    pub workspace_path: String,
+    /// The single instruction text driving the planning gate.
+    pub goal: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanResp {
+    pub plan_id: String,
+    pub modules: Vec<crate::orchestrator::ModuleSpec>,
+    /// Canonical names actually frozen into the registry (post-normalization
+    /// and dedup) — the source of truth downstream steps must conform to.
+    pub frozen_names: Vec<String>,
+    pub trace_id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IndexStatus {
     pub files: usize,

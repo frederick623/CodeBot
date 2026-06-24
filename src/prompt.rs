@@ -28,6 +28,22 @@ pub fn build_prompt(
     retrieved: &[Retrieved],
     budget: ContextBudget,
 ) -> BuiltPrompt {
+    let (ctx, used) = fence_context(retrieved, &budget);
+
+    // Note the strict separation: context first as data, then the user's instruction.
+    let user = format!(
+        "<repo_context>\n{}</repo_context>\n\nUSER REQUEST:\n{}",
+        ctx, user_prompt
+    );
+
+    BuiltPrompt { system: SYSTEM_PROMPT.to_string(), user, files_used: used }
+}
+
+/// Assemble retrieved chunks into fenced, sanitized DATA blocks under a
+/// character budget, returning the context string and the files it drew from.
+/// Shared by the chat path and the planning gate so both embed repository
+/// content through the exact same untrusted-data fence.
+pub fn fence_context(retrieved: &[Retrieved], budget: &ContextBudget) -> (String, Vec<String>) {
     let mut used = Vec::new();
     let mut ctx = String::new();
     let mut spent = 0usize;
@@ -45,13 +61,7 @@ pub fn build_prompt(
         if !used.contains(&r.file) { used.push(r.file.clone()); }
     }
 
-    // Note the strict separation: context first as data, then the user's instruction.
-    let user = format!(
-        "<repo_context>\n{}</repo_context>\n\nUSER REQUEST:\n{}",
-        ctx, user_prompt
-    );
-
-    BuiltPrompt { system: SYSTEM_PROMPT.to_string(), user, files_used: used }
+    (ctx, used)
 }
 
 /// Neutralize any attempt to close our data tags or open fake instruction blocks.

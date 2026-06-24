@@ -41,6 +41,17 @@ pub struct ChunkRow {
     pub content: String,
 }
 
+/// A frozen entry in the interface registry produced by the planning gate. The
+/// canonical `name` is unique per plan and is the source of truth that later
+/// implementation steps must conform to.
+#[derive(Debug, Clone)]
+pub struct PlanSymbol {
+    pub module: String,
+    pub name: String,
+    pub kind: String,
+    pub signature: String,
+}
+
 impl Store {
     pub fn open(db_path: &Path) -> Result<Self> {
         register_sqlite_vec(); // must run before the connection is opened
@@ -83,9 +94,19 @@ impl Store {
                 dst_symbol  TEXT NOT NULL,
                 kind        TEXT NOT NULL   -- "import" | "call" | "reference"
             );
+            CREATE TABLE IF NOT EXISTS plan_symbols (
+                id        INTEGER PRIMARY KEY,
+                plan_id   TEXT NOT NULL,
+                module    TEXT NOT NULL,
+                name      TEXT NOT NULL,
+                kind      TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                UNIQUE(plan_id, name)
+            );
             CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_symbol);
+            CREATE INDEX IF NOT EXISTS idx_plan_symbols_plan ON plan_symbols(plan_id);
             "#,
         )?;
         // The durable embedding store is the `embeddings` BLOB table above. When
@@ -344,6 +365,45 @@ impl Store {
         let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
         let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
         Ok((files as usize, chunks as usize))
+    }
+
+    /// Freeze a planned interface into the registry. Idempotent per `plan_id`:
+    /// existing rows for the plan are cleared first. `INSERT OR IGNORE` enforces
+    /// the `UNIQUE(plan_id,name)` constraint, so duplicate normalized names
+    /// collapse to the first occurrence — the program, not the model, owns the
+    /// final name set.
+    pub fn freeze_plan(&self, plan_id: &str, symbols: &[PlanSymbol]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM plan_symbols WHERE plan_id=?1", params![plan_id])?;
+        for s in symbols {
+            tx.execute(
+                "INSERT OR IGNORE INTO plan_symbols(plan_id,module,name,kind,signature)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![plan_id, s.module, s.name, s.kind, s.signature],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read back the frozen registry for a plan in insertion order. This is the
+    /// canonical name set after normalization and dedup.
+    pub fn get_plan_symbols(&self, plan_id: &str) -> Result<Vec<PlanSymbol>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT module,name,kind,signature FROM plan_symbols
+             WHERE plan_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![plan_id], |row| {
+            Ok(PlanSymbol {
+                module: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                signature: row.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 }
 

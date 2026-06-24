@@ -2,6 +2,7 @@ mod api;
 mod embed_client;
 mod indexer;
 mod llm;
+mod orchestrator;
 mod prompt;
 mod retrieval;
 mod storage;
@@ -18,7 +19,8 @@ use api::*;
 use embed_client::EmbedClient;
 use indexer::Indexer;
 use llm::LlmClient;
-use prompt::{build_prompt, ContextBudget};
+use orchestrator::Orchestrator;
+use prompt::{build_prompt, fence_context, ContextBudget};
 use retrieval::Retriever;
 use storage::Store;
 
@@ -29,6 +31,7 @@ struct AppState {
     llm: LlmClient,
     retriever: Arc<Retriever>,
     indexer: Arc<Indexer>,
+    orchestrator: Arc<Orchestrator>,
     workspaces: Arc<DashMap<String, String>>, // path -> workspace_id
 }
 
@@ -41,9 +44,10 @@ async fn main() -> Result<()> {
     let llm = LlmClient::new("http://127.0.0.1:11434", "qwen2.5-coder:7b"); // any OpenAI-compatible server
     let retriever = Arc::new(Retriever::new(store.clone(), embed.clone()));
     let indexer = Arc::new(Indexer::new(store.clone(), embed.clone()));
+    let orchestrator = Arc::new(Orchestrator::new(store.clone(), llm.clone()));
 
     let state = AppState {
-        store, embed, llm, retriever, indexer,
+        store, embed, llm, retriever, indexer, orchestrator,
         workspaces: Arc::new(DashMap::new()),
     };
 
@@ -51,6 +55,7 @@ async fn main() -> Result<()> {
         .route("/health", get(|| async { Json(serde_json::json!({"status":"ok"})) }))
         .route("/workspace/open", post(open_workspace))
         .route("/chat", post(chat))
+        .route("/plan", post(plan))
         .route("/index/status", get(index_status))
         .with_state(state);
 
@@ -126,6 +131,47 @@ async fn chat(State(st): State<AppState>, Json(req): Json<ChatReq>) -> Json<Chat
         context_used: built.files_used,
         trace_id,
     })
+}
+
+/// Interface-first planning gate. Gathers repo context for the goal (fenced as
+/// untrusted DATA, same path as chat), then runs the orchestrator's structured
+/// planning call and freezes the resulting registry.
+async fn plan(State(st): State<AppState>, Json(req): Json<PlanReq>) -> Json<PlanResp> {
+    let trace_id = Uuid::new_v4().to_string();
+    tracing::info!(trace_id, goal = %req.goal, "plan request");
+
+    // Reuse the hybrid retriever to ground planning in the existing code.
+    let chat_req = ChatReq {
+        workspace_path: req.workspace_path.clone(),
+        active_file: None,
+        selection: None,
+        open_files: vec![],
+        user_prompt: req.goal.clone(),
+    };
+    let retrieved = st
+        .retriever
+        .retrieve(&chat_req, &req.workspace_path)
+        .await
+        .unwrap_or_default();
+    let (context, _used) = fence_context(&retrieved, &ContextBudget { max_chars: 16_000 });
+
+    match st.orchestrator.plan(&req.goal, &context).await {
+        Ok(out) => Json(PlanResp {
+            plan_id: out.plan_id,
+            modules: out.spec.modules,
+            frozen_names: out.frozen_names,
+            trace_id,
+        }),
+        Err(e) => {
+            tracing::error!(trace_id, "plan error: {e}");
+            Json(PlanResp {
+                plan_id: String::new(),
+                modules: vec![],
+                frozen_names: vec![],
+                trace_id,
+            })
+        }
+    }
 }
 
 async fn index_status(State(st): State<AppState>) -> Json<IndexStatus> {
