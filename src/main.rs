@@ -7,17 +7,18 @@ mod prompt;
 mod retrieval;
 mod storage;
 mod tools;
+mod verifier;
 mod watcher;
 
 use anyhow::Result;
 use axum::{extract::State, routing::{get, post}, Json, Router};
 use dashmap::DashMap;
-use std::{path::PathBuf, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use uuid::Uuid;
 
 use api::*;
 use embed_client::EmbedClient;
-use indexer::Indexer;
+use indexer::{detect_lang, Indexer};
 use llm::LlmClient;
 use orchestrator::Orchestrator;
 use prompt::{build_prompt, fence_context, ContextBudget};
@@ -41,7 +42,14 @@ async fn main() -> Result<()> {
 
     let store = Store::open(&PathBuf::from(".assistant.db"))?;
     let embed = EmbedClient::new()?; // loads embedding + rerank models in-process
-    let llm = LlmClient::new("http://127.0.0.1:11434", "qwen2.5-coder:7b"); // any OpenAI-compatible server
+    // Any OpenAI-compatible server. Overridable via env so the daemon can point
+    // at a different host/model without recompiling.
+    let llm_base = std::env::var("CODEBOT_LLM_BASE")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let llm_model = std::env::var("CODEBOT_LLM_MODEL")
+        .unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
+    tracing::info!(%llm_base, %llm_model, "llm configured");
+    let llm = LlmClient::new(llm_base, llm_model);
     let retriever = Arc::new(Retriever::new(store.clone(), embed.clone()));
     let indexer = Arc::new(Indexer::new(store.clone(), embed.clone()));
     let orchestrator = Arc::new(Orchestrator::new(store.clone(), llm.clone()));
@@ -56,6 +64,7 @@ async fn main() -> Result<()> {
         .route("/workspace/open", post(open_workspace))
         .route("/chat", post(chat))
         .route("/plan", post(plan))
+        .route("/verify", post(verify))
         .route("/index/status", get(index_status))
         .with_state(state);
 
@@ -172,6 +181,37 @@ async fn plan(State(st): State<AppState>, Json(req): Json<PlanReq>) -> Json<Plan
             })
         }
     }
+}
+
+/// Deterministic name-registry verification. Parses the candidate `code` with
+/// tree-sitter and checks every function definition against the frozen registry
+/// for `plan_id`, returning violations and an auto-corrected source where the
+/// only fault was casing/style. Unknown language or empty registry → no-op pass.
+async fn verify(State(st): State<AppState>, Json(req): Json<VerifyReq>) -> Json<VerifyResp> {
+    let trace_id = Uuid::new_v4().to_string();
+    let registry: Vec<String> = st
+        .store
+        .get_plan_symbols(&req.plan_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+
+    let report = match detect_lang(Path::new(&req.path)) {
+        Some(lang) if !registry.is_empty() => verifier::verify_names(&req.code, lang, &registry),
+        _ => verifier::VerifyReport { ok: true, violations: vec![], corrected: None },
+    };
+
+    Json(VerifyResp {
+        ok: report.ok,
+        violations: report
+            .violations
+            .into_iter()
+            .map(|v| NameViolationDto { found: v.found, line: v.line, suggestion: v.suggestion })
+            .collect(),
+        corrected: report.corrected,
+        trace_id,
+    })
 }
 
 async fn index_status(State(st): State<AppState>) -> Json<IndexStatus> {

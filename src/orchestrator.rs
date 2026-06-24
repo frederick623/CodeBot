@@ -178,8 +178,9 @@ fn normalize_spec(spec: &mut InterfaceSpec) {
 /// Deterministic identifier normalizer: snake_case, with illegal characters
 /// collapsed to separators. The model's casing/style choices are laundered out
 /// here so the frozen registry is consistent regardless of how sloppy the
-/// proposal was.
-fn to_snake_case(s: &str) -> String {
+/// proposal was. Shared with the verifier so enforcement uses the exact same
+/// rule that produced the registry.
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut out = String::new();
     let mut prev_lower = false;
     for ch in s.chars() {

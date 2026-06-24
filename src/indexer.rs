@@ -117,7 +117,7 @@ impl Indexer {
 #[derive(Clone, Copy)]
 pub enum Lang { Ts, Rust, Python, C, Cpp, Java, CSharp, Go }
 
-fn detect_lang(p: &Path) -> Option<Lang> {
+pub(crate) fn detect_lang(p: &Path) -> Option<Lang> {
     match p.extension().and_then(|e| e.to_str()) {
         Some("ts") | Some("tsx") | Some("js") | Some("jsx") => Some(Lang::Ts),
         Some("rs") => Some(Lang::Rust),
@@ -184,7 +184,46 @@ pub struct Symbol { pub name: String, pub kind: String, pub start: usize, pub en
 /// Extract top-level definitions using tree-sitter queries.
 fn extract_symbols(content: &str, lang: Lang) -> Vec<Symbol> {
     let language = language_for(lang);
-    let query_src = match lang {
+    let query_src = def_query_src(lang);
+
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() { return vec![]; }
+    let tree = match parser.parse(content, None) { Some(t) => t, None => return vec![] };
+    let query = match Query::new(&language, query_src) { Ok(q) => q, Err(_) => return vec![] };
+
+    let name_idx = query.capture_index_for_name("name");
+    let mut cursor = QueryCursor::new();
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+
+    let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+    while let Some(m) = matches.next() {
+        let mut name = String::from("<anon>");
+        let mut node_for_span = None;
+        for cap in m.captures {
+            if Some(cap.index) == name_idx {
+                name = cap.node.utf8_text(bytes).unwrap_or("<anon>").to_string();
+            } else {
+                node_for_span = Some(cap.node);
+            }
+        }
+        if let Some(n) = node_for_span {
+            out.push(Symbol {
+                name,
+                kind: n.kind().to_string(),
+                start: n.start_position().row + 1,
+                end: n.end_position().row + 1,
+            });
+        }
+    }
+    out
+}
+
+/// Per-language definition queries. Each pattern binds the definition node to
+/// `@def` and (where one exists) its name identifier to `@name`. Shared by
+/// `extract_symbols` and `defined_names` so both see the same definition set.
+fn def_query_src(lang: Lang) -> &'static str {
+    match lang {
         Lang::Ts => r#"
             (function_declaration name: (identifier) @name) @def
             (class_declaration name: (type_identifier) @name) @def
@@ -235,35 +274,53 @@ fn extract_symbols(content: &str, lang: Lang) -> Vec<Symbol> {
             (method_declaration name: (field_identifier) @name) @def
             (type_declaration (type_spec name: (type_identifier) @name)) @def
             "#,
-    };
+    }
+}
 
+/// A definition name identifier with its byte span and enclosing definition
+/// kind, so a verifier can rewrite an offending name in place.
+#[derive(Debug, Clone)]
+pub struct NameSpan {
+    pub text: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub line: usize,
+    /// Kind of the `@def` node (e.g. "function_item", "method_declaration").
+    pub kind: String,
+}
+
+/// Byte-accurate spans of every definition *name*, reusing the same per-language
+/// definition queries as `extract_symbols`.
+pub fn defined_names(content: &str, lang: Lang) -> Vec<NameSpan> {
+    let language = language_for(lang);
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() { return vec![]; }
     let tree = match parser.parse(content, None) { Some(t) => t, None => return vec![] };
-    let query = match Query::new(&language, query_src) { Ok(q) => q, Err(_) => return vec![] };
+    let query = match Query::new(&language, def_query_src(lang)) { Ok(q) => q, Err(_) => return vec![] };
 
     let name_idx = query.capture_index_for_name("name");
-    let mut cursor = QueryCursor::new();
     let bytes = content.as_bytes();
+    let mut cursor = QueryCursor::new();
     let mut out = Vec::new();
 
     let mut matches = cursor.matches(&query, tree.root_node(), bytes);
     while let Some(m) = matches.next() {
-        let mut name = String::from("<anon>");
-        let mut node_for_span = None;
+        let mut name_node = None;
+        let mut def_kind = "";
         for cap in m.captures {
             if Some(cap.index) == name_idx {
-                name = cap.node.utf8_text(bytes).unwrap_or("<anon>").to_string();
+                name_node = Some(cap.node);
             } else {
-                node_for_span = Some(cap.node);
+                def_kind = cap.node.kind();
             }
         }
-        if let Some(n) = node_for_span {
-            out.push(Symbol {
-                name,
-                kind: n.kind().to_string(),
-                start: n.start_position().row + 1,
-                end: n.end_position().row + 1,
+        if let Some(n) = name_node {
+            out.push(NameSpan {
+                text: n.utf8_text(bytes).unwrap_or("").to_string(),
+                start_byte: n.start_byte(),
+                end_byte: n.end_byte(),
+                line: n.start_position().row + 1,
+                kind: def_kind.to_string(),
             });
         }
     }

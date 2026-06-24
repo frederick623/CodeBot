@@ -60,6 +60,31 @@ pub struct PlanResp {
     pub trace_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VerifyReq {
+    pub plan_id: String,
+    /// File path; used only to detect the language by extension.
+    pub path: String,
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NameViolationDto {
+    pub found: String,
+    pub line: usize,
+    /// Canonical name to rename to, when the only fault was casing/style.
+    pub suggestion: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyResp {
+    pub ok: bool,
+    pub violations: Vec<NameViolationDto>,
+    /// Source with auto-correctable renames applied; null if nothing changed.
+    pub corrected: Option<String>,
+    pub trace_id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IndexStatus {
     pub files: usize,
