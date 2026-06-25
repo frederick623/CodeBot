@@ -6,6 +6,9 @@ use std::time::Duration;
 pub struct LlmClient {
     base: String,
     model: String,
+    /// Optional bearer token sent as `Authorization: Bearer <key>`. Required by
+    /// OpenAI-compatible servers that enforce auth (vLLM `--api-key`, etc.).
+    api_key: Option<String>,
     http: reqwest::Client,
 }
 
@@ -44,9 +47,26 @@ impl LlmClient {
         Self {
             base: base.into(),
             model: model.into(),
+            api_key: None,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build().unwrap(),
+        }
+    }
+
+    /// Attach a bearer token used to authenticate every request. Empty values
+    /// are treated as "no key" so an unset env var doesn't send `Bearer `.
+    pub fn with_api_key(mut self, key: Option<String>) -> Self {
+        self.api_key = key.filter(|k| !k.trim().is_empty());
+        self
+    }
+
+    /// Build the chat-completions POST, applying bearer auth when configured.
+    fn endpoint(&self) -> reqwest::RequestBuilder {
+        let req = self.http.post(format!("{}/v1/chat/completions", self.base));
+        match &self.api_key {
+            Some(k) => req.bearer_auth(k),
+            None => req,
         }
     }
 
@@ -62,8 +82,7 @@ impl LlmClient {
             response_format: None,
         };
         let resp: ChatCompletion = self
-            .http
-            .post(format!("{}/v1/chat/completions", self.base))
+            .endpoint()
             .json(&body)
             .send().await?.error_for_status()?
             .json().await?;
@@ -97,8 +116,7 @@ impl LlmClient {
             }),
         };
         let resp: ChatCompletion = self
-            .http
-            .post(format!("{}/v1/chat/completions", self.base))
+            .endpoint()
             .json(&body)
             .send().await?.error_for_status()?
             .json().await?;

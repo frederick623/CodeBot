@@ -28,7 +28,7 @@ use crate::tools::ToolExecutor;
 use crate::watcher;
 
 /// Address the daemon listens on. Shared so the GUI knows where to connect.
-pub const DEFAULT_ADDR: &str = "127.0.0.1:9099";
+pub const DEFAULT_ADDR: &str = "localhost:9099";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,11 +50,16 @@ pub fn build_state() -> Result<AppState> {
     // Any OpenAI-compatible server. Overridable via env so the daemon can point
     // at a different host/model without recompiling.
     let llm_base = std::env::var("CODEBOT_LLM_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+        .unwrap_or_else(|_| "http://localhost:8000".to_string());
     let llm_model = std::env::var("CODEBOT_LLM_MODEL")
         .unwrap_or_else(|_| "gpt-oss-20b-mxfp4-q8".to_string());
-    tracing::info!(%llm_base, %llm_model, "llm configured");
-    let llm = LlmClient::new(llm_base, llm_model);
+    // Optional bearer token for servers that enforce auth. Empty/unset → no
+    // Authorization header is sent.
+    let llm_key = std::env::var("CODEBOT_LLM_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .ok();
+    tracing::info!(%llm_base, %llm_model, has_api_key = llm_key.is_some(), "llm configured");
+    let llm = LlmClient::new(llm_base, llm_model).with_api_key(llm_key);
     let retriever = Arc::new(Retriever::new(store.clone(), embed.clone()));
     let indexer = Arc::new(Indexer::new(store.clone(), embed.clone()));
     let orchestrator = Arc::new(Orchestrator::new(store.clone(), llm.clone()));

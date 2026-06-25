@@ -23,7 +23,7 @@ CodeBot is a **Rust-based AI coding assistant daemon** that runs locally alongsi
 ## Architecture Overview
 
 ```
-Editor Extension  ──HTTP──►  codebot-daemon (127.0.0.1:9099)
+Editor Extension  ──HTTP──►  codebot-daemon (localhost:9099)
                                     │
                     ┌───────────────┼────────────────────┐
                     ▼               ▼                    ▼
@@ -44,7 +44,7 @@ Editor Extension  ──HTTP──►  codebot-daemon (127.0.0.1:9099)
                          (OpenAI-compatible API)
 ```
 
-The daemon listens on `127.0.0.1:9099`. An editor extension (not included in this repo) communicates with it via HTTP JSON calls. The daemon indexes the workspace in the background and keeps the index fresh through a filesystem watcher.
+The daemon listens on `localhost:9099`. An editor extension (not included in this repo) communicates with it via HTTP JSON calls. The daemon indexes the workspace in the background and keeps the index fresh through a filesystem watcher.
 
 ---
 
@@ -222,7 +222,7 @@ The daemon reads two environment variables at startup:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CODEBOT_LLM_BASE` | `http://127.0.0.1:8000` | Base URL of any OpenAI-compatible LLM server |
+| `CODEBOT_LLM_BASE` | `http://localhost:8000` | Base URL of any OpenAI-compatible LLM server |
 | `CODEBOT_LLM_MODEL` | `gpt-oss-20b-mxfp4-q8` | Model name sent in API calls |
 
 The SQLite database is written to `.assistant.db` in the working directory. Embedding model weights are cached by fastembed in its default Hugging Face cache directory.
@@ -249,7 +249,7 @@ Several layers prevent prompt injection from repository content:
 cargo build --release
 
 # Run (point at a local OpenAI-compatible server on port 8000)
-CODEBOT_LLM_BASE=http://127.0.0.1:8000 \
+CODEBOT_LLM_BASE=http://localhost:8000 \
 CODEBOT_LLM_MODEL=my-model \
 ./target/release/codebot-daemon
 
@@ -257,4 +257,4 @@ CODEBOT_LLM_MODEL=my-model \
 cargo test
 ```
 
-The daemon listens on `127.0.0.1:9099`. Embedding model weights (~100 MB) are downloaded from Hugging Face on first startup and cached locally.
+The daemon listens on `localhost:9099`. Embedding model weights (~100 MB) are downloaded from Hugging Face on first startup and cached locally.
