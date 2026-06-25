@@ -99,22 +99,21 @@ async fn worker(
     ctx: egui::Context,
 ) {
     let client = reqwest::Client::new();
-    ensure_server(&client, &ui_tx, &ctx).await;
+    // Bring up (or connect to) the server, then immediately index the default
+    // workspace so the user never has to open it by hand. Progress flows into
+    // the Log via `open_workspace` → `watch_indexing`.
+    if ensure_server(&client, &ui_tx, &ctx).await {
+        let default_ws = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if !default_ws.is_empty() {
+            open_workspace(&client, &ui_tx, &ctx, &default_ws).await;
+        }
+    }
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            Cmd::Open(path) => {
-                let r = client
-                    .post(format!("{}/workspace/open", base()))
-                    .json(&serde_json::json!({ "workspace_path": path }))
-                    .send()
-                    .await;
-                match r {
-                    Ok(_) => emit(&ui_tx, &ctx, Ui::Log(format!("opened workspace: {path}"))),
-                    Err(e) => emit(&ui_tx, &ctx, Ui::Error(format!("open failed: {e}"))),
-                }
-                fetch_status(&client, &ui_tx, &ctx).await;
-            }
+            Cmd::Open(path) => open_workspace(&client, &ui_tx, &ctx, &path).await,
             Cmd::Chat { workspace, prompt } => {
                 let r = client
                     .post(format!("{}/chat", base()))
@@ -173,11 +172,12 @@ async fn health(client: &reqwest::Client) -> bool {
 }
 
 /// Connect to an existing server, or start one in-process and wait for it.
-async fn ensure_server(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &egui::Context) {
+/// Returns `true` once the server answers `/health`.
+async fn ensure_server(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &egui::Context) -> bool {
     if health(client).await {
         emit(tx, ctx, Ui::Log("connected to running server".into()));
         emit(tx, ctx, Ui::Health(true));
-        return;
+        return true;
     }
     emit(tx, ctx, Ui::Log("no server found; starting in-process…".into()));
     tokio::spawn(async {
@@ -191,19 +191,76 @@ async fn ensure_server(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &e
         if health(client).await {
             emit(tx, ctx, Ui::Log("server ready".into()));
             emit(tx, ctx, Ui::Health(true));
-            return;
+            return true;
         }
     }
     emit(tx, ctx, Ui::Health(false));
     emit(tx, ctx, Ui::Error("server failed to start".into()));
+    false
 }
 
-/// Fetch and forward the current index status.
+/// Open a workspace (which triggers a background index on the server) and then
+/// watch that index progress off the command loop, so the loop stays free to
+/// service other commands while the Log fills in.
+async fn open_workspace(
+    client: &reqwest::Client,
+    tx: &schan::Sender<Ui>,
+    ctx: &egui::Context,
+    path: &str,
+) {
+    let r = client
+        .post(format!("{}/workspace/open", base()))
+        .json(&serde_json::json!({ "workspace_path": path }))
+        .send()
+        .await;
+    if let Err(e) = r {
+        emit(tx, ctx, Ui::Error(format!("open failed: {e}")));
+        return;
+    }
+    emit(tx, ctx, Ui::Log(format!("opened workspace: {path}")));
+
+    let client = client.clone();
+    let tx = tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move { watch_indexing(&client, &tx, &ctx).await });
+}
+
+/// Fetch and forward the current index status (drives the Refresh button).
 async fn fetch_status(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &egui::Context) {
     let r = client.get(format!("{}/index/status", base())).send().await;
     match parse::<IndexStatus>(r).await {
         Ok(s) => emit(tx, ctx, Ui::Status(s)),
         Err(e) => emit(tx, ctx, Ui::Error(format!("status failed: {e}"))),
+    }
+}
+
+/// Poll `/index/status`, logging progress until the chunk count stabilizes —
+/// the only "indexing done" signal the daemon currently exposes. Also forwards
+/// each status so the header counter stays live during the index.
+async fn watch_indexing(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &egui::Context) {
+    emit(tx, ctx, Ui::Log("indexing started…".into()));
+    let mut last = 0usize;
+    let mut stable = 0u32;
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let r = client.get(format!("{}/index/status", base())).send().await;
+        let s = match parse::<IndexStatus>(r).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let (files, chunks) = (s.files, s.chunks);
+        emit(tx, ctx, Ui::Status(s));
+        if chunks != last {
+            emit(tx, ctx, Ui::Log(format!("indexing… {files} files, {chunks} chunks")));
+            last = chunks;
+            stable = 0;
+        } else if chunks > 0 {
+            stable += 1;
+            if stable >= 4 {
+                emit(tx, ctx, Ui::Log(format!("indexing complete: {files} files, {chunks} chunks")));
+                return;
+            }
+        }
     }
 }
 

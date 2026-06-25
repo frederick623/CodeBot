@@ -129,14 +129,39 @@ async fn chat(State(st): State<AppState>, Json(req): Json<ChatReq>) -> Json<Chat
 
     let root = req.workspace_path.clone();
 
-    // Retrieval: hybrid + rerank.
+    // Retrieval: hybrid + rerank. A retrieval error (typically an embedding
+    // failure) must not masquerade as "no context": surface it instead of
+    // silently handing the model an empty fence.
     let retrieved = match st.retriever.retrieve(&req, &root).await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(trace_id, "retrieval error: {e}");
-            vec![]
+            return Json(ChatResp {
+                answer: format!(
+                    "Retrieval failed before the model was called: {e}. The embedding \
+                     model likely failed to load — check the daemon logs."
+                ),
+                patches: vec![],
+                context_used: vec![],
+                trace_id,
+            });
         }
     };
+
+    // Empty retrieval against an empty store means the workspace hasn't been
+    // indexed yet (indexing runs in the background after /workspace/open).
+    // Report that rather than asking the model to review nothing.
+    if retrieved.is_empty() && st.store.counts().map(|(_, c)| c).unwrap_or(0) == 0 {
+        return Json(ChatResp {
+            answer: "No indexed code yet. Open the workspace (POST /workspace/open) and \
+                     wait for indexing to finish — poll GET /index/status until `chunks` \
+                     is greater than 0 — then retry."
+                .to_string(),
+            patches: vec![],
+            context_used: vec![],
+            trace_id,
+        });
+    }
 
     // Prompt assembly: file content embedded strictly as fenced DATA.
     let built = build_prompt(
