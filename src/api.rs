@@ -28,13 +28,13 @@ pub struct ChatReq {
     pub user_prompt: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Patch {
     pub file: String,
     pub diff: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatResp {
     pub answer: String,
     #[serde(default)]
@@ -124,10 +124,36 @@ pub struct ImplementResp {
     pub trace_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IndexStatus {
     pub files: usize,
     pub chunks: usize,
     pub pending: usize,
     pub last_indexed_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyReq {
+    pub workspace_path: String,
+    /// Workspace-relative target file.
+    pub file: String,
+    /// The unified diff to apply to the current file content.
+    pub diff: String,
+    /// When true, verify the diff applies and return the resulting before→after
+    /// diff without writing anything to disk.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApplyResp {
+    pub ok: bool,
+    pub file: String,
+    /// Clean before→after unified diff, for display; empty when the apply failed.
+    pub diff: String,
+    /// Failure reason when `ok` is false.
+    pub error: Option<String>,
+    /// Echoes whether this was a preview (no write happened).
+    #[serde(default)]
+    pub dry_run: bool,
 }

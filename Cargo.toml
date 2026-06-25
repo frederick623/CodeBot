@@ -37,3 +37,4 @@ dashmap = "6"
 # In-process embeddings + reranking (ONNX runtime, models fetched from HF on first run).
 # Default features drag in image-model codecs we don't need, so enable only text + binaries.
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-native-tls", "ort-download-binaries-native-tls"] }
+eframe = "0.34.3"
