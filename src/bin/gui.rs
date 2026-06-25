@@ -234,34 +234,54 @@ async fn fetch_status(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &eg
     }
 }
 
-/// Poll `/index/status`, logging progress until the chunk count stabilizes —
-/// the only "indexing done" signal the daemon currently exposes. Also forwards
-/// each status so the header counter stays live during the index.
+/// Poll `/index/status`, logging every change until the counts stabilize — the
+/// only "indexing done" signal the daemon currently exposes. Also forwards each
+/// status so the header counter stays live during the index.
 async fn watch_indexing(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &egui::Context) {
     emit(tx, ctx, Ui::Log("indexing started…".into()));
-    let mut last = 0usize;
+    // `None` = no reading yet, so the very first poll always logs (even 0/0),
+    // proving the watcher is alive rather than silently spinning.
+    let mut last: Option<(usize, usize)> = None;
     let mut stable = 0u32;
+    let mut warned = false;
     for _ in 0..600 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let r = client.get(format!("{}/index/status", base())).send().await;
         let s = match parse::<IndexStatus>(r).await {
             Ok(s) => s,
-            Err(_) => continue,
-        };
-        let (files, chunks) = (s.files, s.chunks);
-        emit(tx, ctx, Ui::Status(s));
-        if chunks != last {
-            emit(tx, ctx, Ui::Log(format!("indexing… {files} files, {chunks} chunks")));
-            last = chunks;
-            stable = 0;
-        } else if chunks > 0 {
-            stable += 1;
-            if stable >= 4 {
-                emit(tx, ctx, Ui::Log(format!("indexing complete: {files} files, {chunks} chunks")));
-                return;
+            Err(e) => {
+                // Surface the first failure instead of spinning in silence.
+                if !warned {
+                    emit(tx, ctx, Ui::Log(format!("status check failed: {e}")));
+                    warned = true;
+                }
+                continue;
             }
+        };
+        let cur = (s.files, s.chunks);
+        emit(tx, ctx, Ui::Status(s));
+        if Some(cur) != last {
+            emit(tx, ctx, Ui::Log(format!("indexing… {} files, {} chunks", cur.0, cur.1)));
+            last = Some(cur);
+            stable = 0;
+            continue;
+        }
+        // Counts held steady this tick; after ~2s of no change, call it done.
+        stable += 1;
+        if stable >= 4 {
+            let (files, chunks) = cur;
+            if chunks > 0 {
+                emit(tx, ctx, Ui::Log(format!("indexing complete: {files} files, {chunks} chunks")));
+            } else {
+                emit(tx, ctx, Ui::Log(
+                    "indexing finished but produced no chunks — check the workspace path \
+                     and the daemon logs".into(),
+                ));
+            }
+            return;
         }
     }
+    emit(tx, ctx, Ui::Log("stopped watching index (timed out)".into()));
 }
 
 /// Decode a JSON response body, surfacing transport and decode errors uniformly.
