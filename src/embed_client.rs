@@ -28,7 +28,10 @@ struct Models {
     rerank: Mutex<TextRerank>,
 }
 
-pub struct RerankItem { pub index: usize, pub score: f32 }
+pub struct RerankItem {
+    pub index: usize,
+    pub score: f32,
+}
 
 impl EmbedClient {
     /// Create the client without loading models so the daemon can begin serving
@@ -40,7 +43,8 @@ impl EmbedClient {
     }
 
     async fn models(&self) -> Result<Arc<Models>> {
-        Ok(self.models
+        Ok(self
+            .models
             .get_or_try_init(|| async {
                 tokio::task::spawn_blocking(|| -> Result<Arc<Models>> {
                     tracing::info!("loading embedding and reranking models");
@@ -65,13 +69,18 @@ impl EmbedClient {
         let models = self.models().await?;
         let docs: Vec<String> = inputs.to_vec();
         // CPU-bound inference: keep it off the async runtime's worker threads.
-        let vecs = tokio::task::spawn_blocking(move || models.embed.lock().embed(docs, Some(EMBED_BATCH)))
-            .await??;
+        let vecs =
+            tokio::task::spawn_blocking(move || models.embed.lock().embed(docs, Some(EMBED_BATCH)))
+                .await??;
         Ok(vecs)
     }
 
-    pub async fn rerank(&self, query: &str, docs: &[String], top_k: usize)
-        -> Result<Vec<RerankItem>> {
+    pub async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        top_k: usize,
+    ) -> Result<Vec<RerankItem>> {
         let models = self.models().await?;
         let query = query.to_string();
         let documents: Vec<String> = docs.to_vec();
@@ -81,10 +90,24 @@ impl EmbedClient {
             Ok(results
                 .into_iter()
                 .take(top_k)
-                .map(|r| RerankItem { index: r.index, score: r.score })
+                .map(|r| RerankItem {
+                    index: r.index,
+                    score: r.score,
+                })
                 .collect())
         })
         .await??;
         Ok(items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbedClient;
+
+    #[test]
+    fn construction_does_not_initialize_models() {
+        let client = EmbedClient::new();
+        assert!(client.models.get().is_none());
     }
 }

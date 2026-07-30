@@ -41,12 +41,11 @@ pub struct AppState {
     workspaces: Arc<DashMap<String, String>>, // path -> workspace_id
 }
 
-/// Build the shared application state: opens the store, loads the in-process
-/// embedding/rerank models, and wires up retrieval, indexing and orchestration.
-/// This blocks while model weights are loaded, so call it once at startup.
+/// Build the shared application state and wire up retrieval, indexing and
+/// orchestration. Embedding/rerank models load on their first request.
 pub fn build_state() -> Result<AppState> {
     let store = Store::open(&PathBuf::from(".assistant.db"))?;
-    let embed = EmbedClient::new()?; // loads embedding + rerank models in-process
+    let embed = EmbedClient::new();
     // Any OpenAI-compatible server. Overridable via env so the daemon can point
     // at a different host/model without recompiling.
     let llm_base = std::env::var("CODEBOT_LLM_BASE")

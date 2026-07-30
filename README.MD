@@ -98,7 +98,7 @@ Bootstraps all components, wires them into shared `AppState`, registers HTTP rou
 Pure data layer: all `Request` / `Response` structs for the HTTP API, serialized/deserialized with serde. No logic.
 
 #### `embed_client.rs`
-Wraps `fastembed`'s `TextEmbedding` (BGE-Small-EN-V1.5) and `TextRerank` (BGE-Reranker-Base) behind a `Clone`-able async interface. ONNX inference is CPU-bound and runs in `spawn_blocking` to keep it off the async worker threads. Models are loaded once at startup.
+Wraps `fastembed`'s `TextEmbedding` (BGE-Small-EN-V1.5) and `TextRerank` (BGE-Reranker-Base) behind a `Clone`-able async interface. ONNX inference is CPU-bound and runs in `spawn_blocking` to keep it off the async worker threads. Models are loaded once, on their first embedding or reranking request, so the daemon can serve health checks immediately.
 
 #### `indexer.rs`
 - **Full index**: walks the workspace respecting `.gitignore`, skips files > 1 MB and files whose paths match secret-detection heuristics.
