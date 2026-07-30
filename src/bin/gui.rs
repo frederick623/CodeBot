@@ -185,7 +185,7 @@ async fn ensure_server(client: &reqwest::Client, tx: &schan::Sender<Ui>, ctx: &e
             eprintln!("in-process server exited: {e}");
         }
     });
-    // First boot loads embedding models, which can take a while.
+    // The server responds to health checks before embedding models are needed.
     for _ in 0..600 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if health(client).await {
