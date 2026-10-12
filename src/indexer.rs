@@ -1,6 +1,6 @@
 use crate::embed_client::EmbedClient;
 use crate::storage::Store;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,17 +20,30 @@ impl Indexer {
     }
 
     /// Full walk, but each file is only re-embedded if its content hash changed.
+    /// Files that were indexed under `root` previously but are no longer on disk
+    /// (or are now excluded) are pruned, so counts reflect the live tree.
     pub async fn index_workspace(&self, root: &Path) -> Result<()> {
+        let root_str = root.to_string_lossy().to_string();
+        let mut seen: HashSet<String> = HashSet::new();
         let walker = WalkBuilder::new(root)
             .standard_filters(true) // respects .gitignore, hidden files
             .build();
         for entry in walker.flatten() {
             let path = entry.path();
             if !path.is_file() { continue; }
+            if !is_indexable(path) { continue; }
             if let Ok(meta) = path.metadata() {
                 if meta.len() > MAX_FILE_BYTES { continue; }
             }
-            let _ = self.index_file(path).await;
+            seen.insert(path.to_string_lossy().to_string());
+            if let Err(e) = self.index_file(path).await {
+                tracing::warn!(file = %path.display(), "index failed: {e:#}");
+            }
+        }
+        for stale in self.store.files_under(&root_str)? {
+            if !seen.contains(&stale) {
+                let _ = self.store.invalidate_file(&stale);
+            }
         }
         Ok(())
     }
@@ -38,7 +51,7 @@ impl Indexer {
     /// Incremental: hash content, skip if unchanged, otherwise invalidate + rebuild.
     pub async fn index_file(&self, path: &Path) -> Result<()> {
         let rel = path.to_string_lossy().to_string();
-        if is_probably_secret(&rel) { return Ok(()); }
+        if is_probably_secret(&rel) || !is_indexable(path) { return Ok(()); }
 
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
@@ -51,7 +64,15 @@ impl Indexer {
                 return Ok(()); // unchanged → no work, the heart of incremental indexing
             }
         }
-        self.store.invalidate_file(&rel)?;
+        self.store.invalidate_file(&rel).context("invalidate")?;
+
+        // `chunks.file` has a foreign key to `files.path` (enforced by the
+        // bundled SQLite), so the file row must exist before any chunk is
+        // written. Record it with an empty hash first; the real hash is set
+        // only once everything below succeeded, so a failed pass is retried.
+        let now = now_ms();
+        let size = content.len() as i64;
+        self.store.upsert_file(&rel, "", size, now, now).context("upsert placeholder")?;
 
         let lang = detect_lang(path);
         let chunks = chunk_file(&content, lang);
@@ -61,7 +82,7 @@ impl Indexer {
         if let Some(l) = lang {
             let symbols = extract_symbols(&content, l);
             for sym in &symbols {
-                self.store.insert_symbol(&rel, &sym.name, &sym.kind, sym.start, sym.end)?;
+                self.store.insert_symbol(&rel, &sym.name, &sym.kind, sym.start, sym.end).context("symbol")?;
             }
 
             // File-level import edges: <file>::<file> -> imported module.
@@ -69,7 +90,7 @@ impl Indexer {
             let mut seen: HashSet<(String, String)> = HashSet::new();
             for module in extract_imports(&content, l) {
                 if seen.insert((file_node.clone(), module.clone())) {
-                    self.store.insert_edge(&file_node, &module, "import")?;
+                    self.store.insert_edge(&file_node, &module, "import").context("import edge")?;
                 }
             }
 
@@ -80,7 +101,7 @@ impl Indexer {
                     .map(|s| format!("{}::{}", rel, s))
                     .unwrap_or_else(|| file_node.clone());
                 if seen.insert((src.clone(), callee.clone())) {
-                    self.store.insert_edge(&src, &callee, "call")?;
+                    self.store.insert_edge(&src, &callee, "call").context("call edge")?;
                 }
             }
         }
@@ -89,9 +110,10 @@ impl Indexer {
         let mut chunk_ids = Vec::new();
         let mut payloads = Vec::new();
         for ch in &chunks {
-            let id = self.store.insert_chunk(
-                &rel, ch.start, ch.end, ch.symbol.as_deref(), &ch.text,
-            )?;
+            let id = self
+                .store
+                .insert_chunk(&rel, ch.start, ch.end, ch.symbol.as_deref(), &ch.text)
+                .context("chunk")?;
             chunk_ids.push(id);
             // The text sent for embedding is a DATA payload, never an instruction.
             payloads.push(format!("file: {}\n{}", rel, ch.text));
@@ -99,13 +121,11 @@ impl Indexer {
         if !payloads.is_empty() {
             let vecs = self.embed.embed(&payloads).await?;
             for (id, v) in chunk_ids.iter().zip(vecs) {
-                self.store.insert_embedding(*id, &v)?;
+                self.store.insert_embedding(*id, &v).context("embedding")?;
             }
         }
 
-        let now = now_ms();
-        let size = content.len() as i64;
-        self.store.upsert_file(&rel, &hash, size, now, now)?;
+        self.store.upsert_file(&rel, &hash, size, now, now_ms()).context("upsert file")?;
         Ok(())
     }
 
@@ -571,6 +591,46 @@ fn is_probably_secret(path: &str) -> bool {
     const BANNED: &[&str] = &[".env", "id_rsa", ".pem", ".key", "secrets", ".pfx"];
     let lower = path.to_lowercase();
     BANNED.iter().any(|b| lower.contains(b))
+}
+
+/// Source and project-documentation files worth indexing. Generated artefacts
+/// (lockfiles, minified bundles, binaries, licences) only inflate the file
+/// count and pollute retrieval, so they are skipped up front.
+pub fn is_indexable(path: &Path) -> bool {
+    const SKIP_NAMES: &[&str] = &[
+        "cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+        "poetry.lock", "pipfile.lock", "composer.lock", "gemfile.lock", "go.sum",
+        "license", "license.md", "license.txt", "licence", "copying", "notice",
+        ".ds_store", "thumbs.db",
+    ];
+    const EXTENSIONS: &[&str] = &[
+        // code
+        "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "c", "h", "cc", "cpp", "cxx",
+        "hh", "hpp", "hxx", "java", "kt", "cs", "go", "rb", "php", "swift", "scala",
+        "sh", "bash", "zsh", "fish", "ps1", "sql", "lua", "dart", "ex", "exs", "erl",
+        "hs", "ml", "clj", "zig", "vue", "svelte",
+        // config / docs
+        "md", "markdown", "rst", "txt", "toml", "yaml", "yml", "json", "xml", "ini",
+        "cfg", "conf", "html", "css", "scss", "less", "graphql", "proto",
+        "dockerfile", "makefile", "cmake", "gradle",
+    ];
+    const BARE_NAMES: &[&str] = &["dockerfile", "makefile", "justfile", "rakefile", "procfile"];
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
+        .unwrap_or_default();
+    if SKIP_NAMES.contains(&name.as_str()) {
+        return false;
+    }
+    if name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".map") {
+        return false;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()),
+        None => BARE_NAMES.contains(&name.as_str()),
+    }
 }
 
 fn now_ms() -> i64 {
