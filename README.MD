@@ -1,6 +1,6 @@
 # CodeBot
 
-CodeBot is a **Rust-based AI coding assistant daemon** that runs locally alongside your editor. It indexes your workspace, retrieves semantically relevant code, and drives a local (or remote) LLM to answer questions, generate code, and apply patches — all while keeping repository content strictly sandboxed from instructions.
+CodeBot is a **lightweight, prompt-driven IDE** (in the spirit of OpenCode / Claude Code) built around a Rust daemon and a small egui desktop GUI. It is designed for **weak local LLMs**: the program — not the model — does the heavy lifting of indexing the project, resolving symbols and call graphs, choosing what to read, remembering past turns, and turning the model's `SEARCH/REPLACE` blocks into real, syntax-checked file edits. Repository content stays strictly sandboxed from instructions.
 
 ---
 
@@ -11,10 +11,12 @@ CodeBot is a **Rust-based AI coding assistant daemon** that runs locally alongsi
 - [Source Layout](#source-layout)
 - [API Endpoints](#api-endpoints)
 - [Core Workflows](#core-workflows)
+  - [Agent Turn (Ask / Agent mode)](#agent-turn-ask--agent-mode)
   - [Chat](#chat)
   - [Plan → Verify → Implement](#plan--verify--implement)
   - [Workspace Indexing](#workspace-indexing)
 - [Configuration](#configuration)
+- [Desktop GUI](#desktop-gui)
 - [Security Design](#security-design)
 - [Building and Running](#building-and-running)
 
@@ -75,24 +77,42 @@ The daemon listens on `localhost:9099`. An editor extension (not included in thi
 
 ```
 src/
-├── main.rs          # Entry point: server setup, route handlers, diff extraction utilities
-├── api.rs           # Request/response DTOs for all HTTP endpoints
+├── main.rs          # Headless daemon entry point (logging + server::run)
+├── lib.rs           # Library crate shared by the daemon and the GUI
+├── server.rs        # HTTP API: routes, AppState, agent run registry, settings, git endpoints
+├── agent.rs         # Program-driven agent loop: memory + project map + retrieval → plan → answer/edit
+├── edits.rs         # SEARCH/REPLACE block parser and fuzzy, indentation-tolerant applier
+├── api.rs           # Request/response DTOs for the legacy HTTP endpoints
 ├── embed_client.rs  # In-process embedding + reranking via fastembed/ONNX
-├── indexer.rs       # Workspace indexer: AST chunking, symbol/call/import graph, incremental hashing
-├── llm.rs           # OpenAI-compatible LLM client (chat + structured JSON output)
+├── indexer.rs       # Workspace indexer: file filter, AST chunking, symbol/call/import graph, pruning
+├── llm.rs           # OpenAI-compatible LLM client (history chat, lenient JSON, model listing)
 ├── orchestrator.rs  # Planning gate and implement loop (plan → generate → verify → retry)
 ├── prompt.rs        # Prompt assembly with context budgeting and untrusted-data fencing
-├── retrieval.rs     # Hybrid retrieval: active file + symbol lookup + vector KNN + reranking
-├── storage.rs       # SQLite store: file index, chunk/embedding store, symbol graph, plan/task tables
-├── tools.rs         # Tool executor: file read, ripgrep search, patch preview/apply, test runner
+├── retrieval.rs     # Root-scoped hybrid retrieval: symbols + vector KNN + call-graph expansion + rerank
+├── storage.rs       # SQLite store: files/chunks/embeddings, symbol graph, settings, messages, memory
+├── tools.rs         # Tool executor: safe file IO, literal search, patch apply, git changes/revert
 ├── verifier.rs      # Deterministic verification cascade: parse → names → references
-└── watcher.rs       # Filesystem watcher that feeds changed paths to the incremental indexer
+├── watcher.rs       # Filesystem watcher that feeds changed paths to the incremental indexer
+└── bin/gui/
+    ├── main.rs      # egui desktop app: chat transcript, prompt box, Changes pane, settings, log
+    └── markdown.rs  # Markdown → egui renderer (headings, tables, lists, code) + glyph normalisation
 ```
 
 ### Module Responsibilities
 
-#### `main.rs`
-Bootstraps all components, wires them into shared `AppState`, registers HTTP routes, and contains the utility functions for extracting unified diffs from LLM responses (fence scrubbing, section splitting, target path resolution).
+#### `main.rs` / `server.rs`
+`main.rs` only initialises logging and calls `server::run`. `server.rs` bootstraps all components into a shared `AppState`, registers the HTTP routes, keeps the in-flight agent runs (`/agent/run` → `/agent/status`), hot-swaps the LLM client when settings change, and contains the unified-diff extraction utilities used by `/chat`.
+
+#### `agent.rs`
+The core of the IDE. One turn runs as a *program-driven* loop so a small model only ever has to do one easy thing at a time:
+
+1. **Gather (program).** Recent memory notes, conversation history, a compact *project map* (every indexed file with the symbols it defines) and hybrid retrieval seeded by the prompt (symbols → one-hop call-graph neighbours → vector KNN → rerank).
+2. **Plan (model, JSON).** Decide `intent` (`answer` | `edit`), up to 4 files to read in full and up to 3 literal search terms. Falls back to retrieval only if the model cannot produce JSON.
+3. **Answer or edit (model).** Ask mode answers in Markdown. Agent mode requests `SEARCH/REPLACE` blocks (never unified diffs, which weak models get wrong), applies them in memory, parse-checks the result with tree-sitter, and retries once with precise feedback plus the live file contents before writing to disk and re-indexing.
+4. **Remember (program).** The turn and a one-line memory note are persisted per workspace.
+
+#### `edits.rs`
+Parses `path` + `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks and applies them with three strategies — exact match, indentation-tolerant line match, then fuzzy match (similarity ≥ 0.88) — re-indenting the replacement to the matched block. Empty `SEARCH` creates a new file. CRLF endings are preserved.
 
 #### `api.rs`
 Pure data layer: all `Request` / `Response` structs for the HTTP API, serialized/deserialized with serde. No logic.
@@ -169,11 +189,32 @@ Starts a debounced filesystem watcher (400 ms debounce) on the workspace root. F
 | `POST` | `/plan` | Interface-first planning gate: returns a frozen module/function spec and plan ID |
 | `POST` | `/verify` | Run the deterministic cascade on a code snippet against a plan's registry |
 | `POST` | `/implement` | Drive all pending tasks for a plan through generate→verify→retry |
-| `GET` | `/index/status` | Returns the current count of indexed files and chunks |
+| `GET` | `/index/status?workspace_path=` | Indexed file/chunk counts for a workspace (whole store when omitted) |
+| `POST` | `/agent/run` | Start an agent turn `{workspace_path, prompt, mode: "ask"|"agent"}` → `{run_id}` |
+| `GET` | `/agent/status?run_id=` | Poll a run: `{steps[], done, result{answer, edited[], failed[], context_used[]}, error}` |
+| `GET` / `DELETE` | `/history?workspace_path=` | Read / clear the persisted conversation for a workspace |
+| `GET` / `POST` | `/settings` | Read / update `llm_base`, `llm_model`, `llm_api_key` (write-only), `context_chars` — applied immediately |
+| `GET` | `/models` | Model IDs reported by the configured LLM server (`/v1/models`) |
+| `GET` | `/git/changes?workspace_path=` | Working-tree changes vs `HEAD`: `[{path, status, diff, additions, deletions}]` |
+| `POST` | `/git/revert` | `{workspace_path, file}` — restore a tracked file from `HEAD` or delete an untracked one |
 
 ---
 
 ## Core Workflows
+
+### Agent Turn (Ask / Agent mode)
+
+```
+POST /agent/run   { "workspace_path": "/path/to/repo", "prompt": "make greet use an f-string", "mode": "agent" }
+→ { "run_id": "…" }
+
+GET /agent/status?run_id=…
+→ { "steps": ["gathering context…", "plan: edit greet", "reading src/greet.py", "applying 2 edit block(s)", "wrote src/greet.py"],
+    "done": true,
+    "result": { "answer": "…markdown…", "edited": [{"path": "src/greet.py", "created": false}], "failed": [], "context_used": [...] } }
+```
+
+The run executes in the background; the GUI streams `steps` into the transcript and refreshes the Changes pane when `done` flips. `mode: "ask"` never writes files.
 
 ### Chat
 
@@ -212,20 +253,38 @@ POST /implement  { "plan_id": "...", "path": "src/auth.rs", "max_attempts": 3 }
 POST /workspace/open  { "workspace_path": "/path/to/repo" }
 ```
 
-This triggers an **asynchronous** full walk of the workspace. Files are parsed with tree-sitter, chunked, embedded in batches of 32, and stored in SQLite. A filesystem watcher is started afterwards for incremental updates. The response returns immediately with `"indexed": false`; poll `/index/status` to track progress.
+This triggers an **asynchronous** full walk of the workspace. Only source/config/doc files pass the `is_indexable` filter (lockfiles, licences, minified bundles, `.map`, binaries and `.gitignore`d paths are skipped); entries for files that no longer exist are pruned. Files are parsed with tree-sitter, chunked, embedded in batches of 32, and stored in SQLite under their absolute path, so one `.assistant.db` can hold several workspaces and every query is scoped to the workspace root. A filesystem watcher is started afterwards for incremental updates. The response returns immediately with `"indexed": false`; poll `/index/status?workspace_path=…` to track progress.
 
 ---
 
 ## Configuration
 
-The daemon reads two environment variables at startup:
+LLM settings are resolved as **stored settings → environment → defaults**, and can be changed at runtime from the GUI (⚙ Settings) or `POST /settings` without restarting.
 
-| Variable | Default | Description |
+| Setting / Variable | Default | Description |
 |---|---|---|
-| `CODEBOT_LLM_BASE` | `http://localhost:8000` | Base URL of any OpenAI-compatible LLM server |
-| `CODEBOT_LLM_MODEL` | `gpt-oss-20b-mxfp4-q8` | Model name sent in API calls |
+| `llm_base` / `CODEBOT_LLM_BASE` | `http://localhost:8000` | Base URL of any OpenAI-compatible server (llama.cpp, Ollama, LM Studio, vLLM, …) |
+| `llm_model` / `CODEBOT_LLM_MODEL` | `gpt-oss-20b-mxfp4-q8` | Model name sent in API calls; pick from `/models` in the GUI |
+| `llm_api_key` / `CODEBOT_LLM_API_KEY` (or `OPENAI_API_KEY`) | *(none)* | Bearer token, only needed for hosted endpoints |
+| `context_chars` | `24000` | Character budget for repository context per model call — lower it for small-context models |
 
-The SQLite database is written to `.assistant.db` in the working directory. Embedding model weights are cached by fastembed in its default Hugging Face cache directory.
+The SQLite database is written to `.assistant.db` in the daemon's working directory. Embedding model weights are cached by fastembed in its default Hugging Face cache directory.
+
+**Working with a weak local model.** `response_format: json_schema` is attempted first and falls back to plain prompting with JSON extraction when the server rejects it; model calls time out after 10 minutes; edits are requested as short `SEARCH/REPLACE` blocks and matched fuzzily, so minor copy errors still apply; syntax is verified before anything is written.
+
+---
+
+## Desktop GUI
+
+```bash
+cargo run --bin gui          # connects to a running daemon on :9099 or starts one in-process
+```
+
+- **Transcript** — Markdown answers rendered natively (headings, tables, lists, fenced code, inline code/bold/italic). Typographic characters the bundled fonts lack (e.g. non-breaking hyphens) are normalised so no "□" boxes appear.
+- **Prompt** — `Enter` sends, `Ctrl+Enter` inserts a newline. Toggle **Agent** (may edit files) / **Ask** (read-only).
+- **Changes pane (right)** — every file that differs from git `HEAD`, with `A`/`M`/`D` badges, `+/-` line counts, an expandable coloured diff and a per-file **Revert**. Refreshes after each run and every 5 s.
+- **Settings** — LLM base URL, model (with a dropdown from `/models`), API key, context budget; saved to the store and applied immediately.
+- **Status / Log** — indexed file and chunk counts for the open workspace, plus agent steps and server events.
 
 ---
 
@@ -237,7 +296,7 @@ Several layers prevent prompt injection from repository content:
 2. **Fence sanitization** — `</file>`, `<repo_context>`, and `</repo_context>` are neutralized inside chunk content before they reach the model, preventing tag breakout.
 3. **Planning constraint** — the planning call uses `response_format: json_schema` with `strict: true` at temperature 0, so the model cannot emit prose or code bodies — only a machine-readable interface spec.
 4. **Deterministic name gate** — generated code is verified against a registry that the model cannot modify; name drift is corrected without asking the model.
-5. **Path traversal guard** — `tools.rs` canonicalizes all file paths and rejects anything that escapes the workspace root.
+5. **Path traversal guard** — `tools.rs` rejects absolute paths and `..` components lexically, then canonicalizes and rejects anything that escapes the workspace root (also applied to `/git/revert`).
 6. **Secret skipping** — the indexer skips files whose paths match common secret-file patterns (e.g., `.env`, key files).
 
 ---
@@ -248,13 +307,18 @@ Several layers prevent prompt injection from repository content:
 # Build
 cargo build --release
 
-# Run (point at a local OpenAI-compatible server on port 8000)
+# Run the headless daemon (point at a local OpenAI-compatible server on port 8000)
 CODEBOT_LLM_BASE=http://localhost:8000 \
 CODEBOT_LLM_MODEL=my-model \
 ./target/release/codebot-daemon
 
+# Or run the desktop GUI (starts the daemon in-process if none is listening)
+./target/release/gui
+
 # Run tests
 cargo test
 ```
+
+Typical local setup: start `llama-server -m model.gguf --port 8000` (or `ollama serve` with `CODEBOT_LLM_BASE=http://localhost:11434`), launch the GUI, type the project path in **Workspace** and press **Open**, wait for the file/chunk counter to settle, then ask or instruct.
 
 The daemon listens on `localhost:9099`. Embedding model weights (~100 MB) are downloaded from Hugging Face on first startup and cached locally.

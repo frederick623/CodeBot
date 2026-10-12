@@ -1,5 +1,6 @@
 use crate::indexer::{detect_lang, Lang};
 use crate::llm::LlmClient;
+use crate::server::SharedLlm;
 use crate::storage::{PlanSymbol, Store, TaskRow};
 use crate::verifier::{run_cascade, CascadeReport};
 use anyhow::Result;
@@ -15,7 +16,7 @@ use uuid::Uuid;
 /// becomes the single source of truth for names in later implementation steps.
 pub struct Orchestrator {
     store: Store,
-    llm: LlmClient,
+    llm: SharedLlm,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,8 +68,13 @@ SECURITY RULES (non-negotiable):
 Do not write function bodies, comments, or explanations. Emit only the interface."#;
 
 impl Orchestrator {
-    pub fn new(store: Store, llm: LlmClient) -> Self {
+    pub fn new(store: Store, llm: SharedLlm) -> Self {
         Self { store, llm }
+    }
+
+    /// Snapshot of the currently configured client (settings may change at runtime).
+    fn llm(&self) -> LlmClient {
+        self.llm.read().clone()
     }
 
     /// Run the planning gate: constrained-decode an interface spec, normalize
@@ -76,7 +82,7 @@ impl Orchestrator {
     pub async fn plan(&self, goal: &str, context: &str) -> Result<PlanOutcome> {
         let user = format!("<repo_context>\n{}</repo_context>\n\nGOAL:\n{}", context, goal);
         let raw = self
-            .llm
+            .llm()
             .complete_json(PLAN_SYSTEM, &user, "interface_spec", spec_schema())
             .await?;
 
@@ -156,7 +162,7 @@ impl Orchestrator {
 
             let history = self.store.get_error_history(task.id)?;
             let user = build_impl_prompt(&task.name, &signature, registry, &history);
-            let code = match self.llm.chat(IMPL_SYSTEM, &user).await {
+            let code = match self.llm().chat(IMPL_SYSTEM, &user).await {
                 Ok(raw) => strip_fences(&raw).to_string(),
                 Err(e) => {
                     self.store.log_error(task.id, attempt, "llm", &e.to_string())?;
@@ -507,7 +513,7 @@ mod tests {
     async fn exact_name_reaches_verified_in_one_attempt() {
         let (store, plan_id) = seed_store();
         let base = spawn_mock("fn verify_token(token: String) -> bool { true }".to_string()).await;
-        let orch = Orchestrator::new(store.clone(), LlmClient::new(base, "mock"));
+        let orch = Orchestrator::new(store.clone(), std::sync::Arc::new(parking_lot::RwLock::new(LlmClient::new(base, "mock"))));
 
         let outcomes = orch.implement(&plan_id, "auth.rs", 3).await.unwrap();
         assert_eq!(outcomes.len(), 1);
@@ -522,7 +528,7 @@ mod tests {
         let (store, plan_id) = seed_store();
         // camelCase name: normalizes onto the registry, so the gate auto-fixes it.
         let base = spawn_mock("fn verifyToken(token: String) -> bool { true }".to_string()).await;
-        let orch = Orchestrator::new(store.clone(), LlmClient::new(base, "mock"));
+        let orch = Orchestrator::new(store.clone(), std::sync::Arc::new(parking_lot::RwLock::new(LlmClient::new(base, "mock"))));
 
         let outcomes = orch.implement(&plan_id, "auth.rs", 3).await.unwrap();
         assert_eq!(outcomes[0].status, "verified");
@@ -536,7 +542,7 @@ mod tests {
         let (store, plan_id) = seed_store();
         // An invented symbol has no deterministic fix → retried then failed.
         let base = spawn_mock("fn helper() {}".to_string()).await;
-        let orch = Orchestrator::new(store.clone(), LlmClient::new(base, "mock"));
+        let orch = Orchestrator::new(store.clone(), std::sync::Arc::new(parking_lot::RwLock::new(LlmClient::new(base, "mock"))));
 
         let outcomes = orch.implement(&plan_id, "auth.rs", 3).await.unwrap();
         assert_eq!(outcomes[0].status, "failed");

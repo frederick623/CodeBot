@@ -4,7 +4,9 @@
 //! so multiple binaries (the headless daemon and the standalone GUI) can reuse
 //! the exact same code. The GUI can therefore bring up the server in-process
 //! when one is not already listening, while still talking to it over HTTP.
+pub mod agent;
 pub mod api;
+pub mod edits;
 pub mod embed_client;
 pub mod indexer;
 pub mod llm;

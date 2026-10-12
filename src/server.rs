@@ -5,17 +5,19 @@
 //! in-process when `/health` is not already answering.
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     routing::{get, post},
     Json, Router,
 };
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 use uuid::Uuid;
 
+use crate::agent::{Agent, AgentResult, Mode};
 use crate::api::*;
 use crate::embed_client::EmbedClient;
 use crate::indexer::{detect_lang, Indexer};
@@ -30,15 +32,50 @@ use crate::watcher;
 /// Address the daemon listens on. Shared so the GUI knows where to connect.
 pub const DEFAULT_ADDR: &str = "localhost:9099";
 
+/// The LLM client behind a lock so `/settings` can swap endpoint/model at
+/// runtime without restarting the daemon.
+pub type SharedLlm = Arc<parking_lot::RwLock<LlmClient>>;
+
+/// Live state of one agent run, polled by the GUI.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RunState {
+    pub steps: Vec<String>,
+    pub done: bool,
+    pub result: Option<AgentResult>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
     embed: EmbedClient,
-    llm: LlmClient,
+    llm: SharedLlm,
     retriever: Arc<Retriever>,
     indexer: Arc<Indexer>,
     orchestrator: Arc<Orchestrator>,
+    agent: Arc<Agent>,
     workspaces: Arc<DashMap<String, String>>, // path -> workspace_id
+    runs: Arc<DashMap<String, RunState>>,     // run_id -> progress
+}
+
+/// Resolve LLM configuration: persisted settings win, then env vars, then
+/// defaults — so the GUI's settings survive restarts while env still works
+/// for headless deployments.
+fn configure_llm(store: &Store) -> LlmClient {
+    let setting = |k: &str| store.get_setting(k).ok().flatten().filter(|v| !v.trim().is_empty());
+    let llm_base = setting("llm_base")
+        .or_else(|| std::env::var("CODEBOT_LLM_BASE").ok())
+        .unwrap_or_else(|| "http://localhost:8000".to_string());
+    let llm_model = setting("llm_model")
+        .or_else(|| std::env::var("CODEBOT_LLM_MODEL").ok())
+        .unwrap_or_else(|| "gpt-oss-20b-mxfp4-q8".to_string());
+    // Optional bearer token for servers that enforce auth. Empty/unset → no
+    // Authorization header is sent.
+    let llm_key = setting("llm_api_key")
+        .or_else(|| std::env::var("CODEBOT_LLM_API_KEY").ok())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+    tracing::info!(%llm_base, %llm_model, has_api_key = llm_key.is_some(), "llm configured");
+    LlmClient::new(llm_base, llm_model).with_api_key(llm_key)
 }
 
 /// Build the shared application state and wire up retrieval, indexing and
@@ -46,22 +83,11 @@ pub struct AppState {
 pub fn build_state() -> Result<AppState> {
     let store = Store::open(&PathBuf::from(".assistant.db"))?;
     let embed = EmbedClient::new();
-    // Any OpenAI-compatible server. Overridable via env so the daemon can point
-    // at a different host/model without recompiling.
-    let llm_base = std::env::var("CODEBOT_LLM_BASE")
-        .unwrap_or_else(|_| "http://localhost:8000".to_string());
-    let llm_model = std::env::var("CODEBOT_LLM_MODEL")
-        .unwrap_or_else(|_| "gpt-oss-20b-mxfp4-q8".to_string());
-    // Optional bearer token for servers that enforce auth. Empty/unset → no
-    // Authorization header is sent.
-    let llm_key = std::env::var("CODEBOT_LLM_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .ok();
-    tracing::info!(%llm_base, %llm_model, has_api_key = llm_key.is_some(), "llm configured");
-    let llm = LlmClient::new(llm_base, llm_model).with_api_key(llm_key);
+    let llm: SharedLlm = Arc::new(parking_lot::RwLock::new(configure_llm(&store)));
     let retriever = Arc::new(Retriever::new(store.clone(), embed.clone()));
     let indexer = Arc::new(Indexer::new(store.clone(), embed.clone()));
     let orchestrator = Arc::new(Orchestrator::new(store.clone(), llm.clone()));
+    let agent = Arc::new(Agent::new(store.clone(), retriever.clone(), indexer.clone()));
 
     Ok(AppState {
         store,
@@ -70,7 +96,9 @@ pub fn build_state() -> Result<AppState> {
         retriever,
         indexer,
         orchestrator,
+        agent,
         workspaces: Arc::new(DashMap::new()),
+        runs: Arc::new(DashMap::new()),
     })
 }
 
@@ -80,6 +108,13 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(|| async { Json(serde_json::json!({"status":"ok"})) }))
         .route("/workspace/open", post(open_workspace))
         .route("/chat", post(chat))
+        .route("/agent/run", post(agent_run))
+        .route("/agent/status", get(agent_status))
+        .route("/history", get(history).delete(clear_history))
+        .route("/settings", get(get_settings).post(set_settings))
+        .route("/models", get(list_models))
+        .route("/git/changes", get(git_changes))
+        .route("/git/revert", post(git_revert))
         .route("/plan", post(plan))
         .route("/verify", post(verify))
         .route("/implement", post(implement))
@@ -150,7 +185,7 @@ async fn chat(State(st): State<AppState>, Json(req): Json<ChatReq>) -> Json<Chat
     // Empty retrieval against an empty store means the workspace hasn't been
     // indexed yet (indexing runs in the background after /workspace/open).
     // Report that rather than asking the model to review nothing.
-    if retrieved.is_empty() && st.store.counts().map(|(_, c)| c).unwrap_or(0) == 0 {
+    if retrieved.is_empty() && st.store.counts(&root).map(|(_, c)| c).unwrap_or(0) == 0 {
         return Json(ChatResp {
             answer: "No indexed code yet. Open the workspace (POST /workspace/open) and \
                      wait for indexing to finish — poll GET /index/status until `chunks` \
@@ -170,7 +205,8 @@ async fn chat(State(st): State<AppState>, Json(req): Json<ChatReq>) -> Json<Chat
     );
 
     // Model call.
-    let answer = match st.llm.chat(&built.system, &built.user).await {
+    let llm = st.llm.read().clone();
+    let answer = match llm.chat(&built.system, &built.user).await {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(trace_id, "llm error: {e}");
@@ -309,14 +345,197 @@ async fn implement(State(st): State<AppState>, Json(req): Json<ImplementReq>) ->
     Json(ImplementResp { plan_id: req.plan_id, tasks, trace_id })
 }
 
-async fn index_status(State(st): State<AppState>) -> Json<IndexStatus> {
-    let (files, chunks) = st.store.counts().unwrap_or((0, 0));
+#[derive(Deserialize)]
+pub struct WorkspaceQuery {
+    /// Workspace root; when omitted the whole shared store is counted.
+    pub workspace_path: Option<String>,
+}
+
+async fn index_status(State(st): State<AppState>, Query(q): Query<WorkspaceQuery>) -> Json<IndexStatus> {
+    let (files, chunks) = match q.workspace_path.as_deref().filter(|p| !p.is_empty()) {
+        Some(root) => st.store.counts(root).unwrap_or((0, 0)),
+        None => st.store.total_counts().unwrap_or((0, 0)),
+    };
     Json(IndexStatus {
         files,
         chunks,
         pending: 0,
         last_indexed_ms: 0,
     })
+}
+
+// ----- agent -----------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct AgentRunReq {
+    pub workspace_path: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub mode: Mode,
+}
+
+#[derive(Serialize)]
+pub struct AgentRunResp {
+    pub run_id: String,
+}
+
+/// Start an agent turn in the background and return a `run_id` immediately;
+/// progress and the final result are polled via `/agent/status`.
+async fn agent_run(State(st): State<AppState>, Json(req): Json<AgentRunReq>) -> Json<AgentRunResp> {
+    let run_id = Uuid::new_v4().to_string();
+    st.runs.insert(run_id.clone(), RunState::default());
+    tracing::info!(run_id, prompt = %req.prompt, mode = ?req.mode, "agent run");
+
+    let runs = st.runs.clone();
+    let agent = st.agent.clone();
+    let llm = st.llm.read().clone();
+    let id = run_id.clone();
+    tokio::spawn(async move {
+        let steps = runs.clone();
+        let sid = id.clone();
+        let emit: crate::agent::Emit = Arc::new(move |msg: String| {
+            if let Some(mut r) = steps.get_mut(&sid) {
+                r.steps.push(msg);
+            }
+        });
+        let outcome = agent.run(&llm, &req.workspace_path, &req.prompt, req.mode, emit).await;
+        if let Some(mut r) = runs.get_mut(&id) {
+            r.done = true;
+            match outcome {
+                Ok(res) => r.result = Some(res),
+                Err(e) => r.error = Some(e.to_string()),
+            }
+        }
+    });
+    Json(AgentRunResp { run_id })
+}
+
+#[derive(Deserialize)]
+pub struct RunQuery {
+    pub run_id: String,
+}
+
+async fn agent_status(State(st): State<AppState>, Query(q): Query<RunQuery>) -> Json<RunState> {
+    let state = st.runs.get(&q.run_id).map(|r| r.clone()).unwrap_or_else(|| RunState {
+        done: true,
+        error: Some("unknown run".into()),
+        ..Default::default()
+    });
+    // Finished runs are dropped once the client has read them.
+    if state.done {
+        st.runs.remove(&q.run_id);
+    }
+    Json(state)
+}
+
+#[derive(Serialize)]
+pub struct HistoryTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Persisted conversation for a workspace (most recent 50 turns).
+async fn history(State(st): State<AppState>, Query(q): Query<WorkspaceQuery>) -> Json<Vec<HistoryTurn>> {
+    let root = q.workspace_path.unwrap_or_default();
+    let turns = st
+        .store
+        .recent_messages(&root, 50)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(role, content)| HistoryTurn { role, content })
+        .collect();
+    Json(turns)
+}
+
+async fn clear_history(State(st): State<AppState>, Query(q): Query<WorkspaceQuery>) -> Json<serde_json::Value> {
+    let root = q.workspace_path.unwrap_or_default();
+    let ok = st.store.clear_messages(&root).is_ok();
+    Json(serde_json::json!({ "ok": ok }))
+}
+
+// ----- settings ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Settings {
+    pub llm_base: String,
+    pub llm_model: String,
+    /// Write-only: never echoed back, `has_api_key` reports presence instead.
+    #[serde(default, skip_serializing)]
+    pub llm_api_key: Option<String>,
+    #[serde(default)]
+    pub has_api_key: bool,
+    pub context_chars: usize,
+}
+
+async fn get_settings(State(st): State<AppState>) -> Json<Settings> {
+    let llm = st.llm.read().clone();
+    let context_chars = st
+        .store
+        .get_setting("context_chars")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24_000);
+    Json(Settings {
+        llm_base: llm.base().to_string(),
+        llm_model: llm.model().to_string(),
+        llm_api_key: None,
+        has_api_key: llm.has_api_key(),
+        context_chars,
+    })
+}
+
+/// Persist settings and hot-swap the LLM client. An empty `llm_api_key`
+/// string clears the stored key; `None` leaves it untouched.
+async fn set_settings(State(st): State<AppState>, Json(s): Json<Settings>) -> Json<Settings> {
+    let _ = st.store.set_setting("llm_base", s.llm_base.trim());
+    let _ = st.store.set_setting("llm_model", s.llm_model.trim());
+    let _ = st.store.set_setting("context_chars", &s.context_chars.to_string());
+    if let Some(key) = &s.llm_api_key {
+        let _ = st.store.set_setting("llm_api_key", key.trim());
+    }
+    *st.llm.write() = configure_llm(&st.store);
+    get_settings(State(st)).await
+}
+
+async fn list_models(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let llm = st.llm.read().clone();
+    match llm.list_models().await {
+        Ok(models) => Json(serde_json::json!({ "models": models })),
+        Err(e) => Json(serde_json::json!({ "models": [], "error": e.to_string() })),
+    }
+}
+
+// ----- git -------------------------------------------------------------------
+
+async fn git_changes(Query(q): Query<WorkspaceQuery>) -> Json<Vec<crate::tools::GitChange>> {
+    let root = q.workspace_path.unwrap_or_default();
+    if root.is_empty() {
+        return Json(vec![]);
+    }
+    Json(ToolExecutor::new(root).git_changes().unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+pub struct RevertReq {
+    pub workspace_path: String,
+    pub file: String,
+}
+
+async fn git_revert(State(st): State<AppState>, Json(req): Json<RevertReq>) -> Json<serde_json::Value> {
+    let tools = ToolExecutor::new(req.workspace_path.clone());
+    match tools.git_revert(&req.file) {
+        Ok(()) => {
+            let abs = Path::new(&req.workspace_path).join(&req.file);
+            if abs.exists() {
+                let _ = st.indexer.index_file(&abs).await;
+            } else {
+                let _ = st.indexer.remove_file(&abs);
+            }
+            Json(serde_json::json!({ "ok": true }))
+        }
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 /// Apply a unified diff to a workspace file, gated by explicit client approval.
