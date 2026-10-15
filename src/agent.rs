@@ -21,7 +21,7 @@
 use crate::api::ChatReq;
 use crate::edits::{self, EditBlock};
 use crate::indexer::{detect_lang, syntax_errors, Indexer};
-use crate::llm::LlmClient;
+use crate::llm::{with_progress, LlmClient};
 use crate::prompt::{fence_context, ContextBudget};
 use crate::retrieval::{Retrieved, Retriever};
 use crate::storage::Store;
@@ -176,7 +176,10 @@ impl Agent {
             open_files: vec![],
             user_prompt: prompt.to_string(),
         };
-        let mut retrieved = match self.retriever.retrieve_with(&req, &root, 12).await {
+        let mut retrieved = match with_progress(
+            "retrieving context", emit.as_ref(),
+            self.retriever.retrieve_with(&req, &root, 12),
+        ).await {
             Ok(r) => r,
             Err(e) => {
                 emit(format!("retrieval unavailable ({e}); continuing with the project map only"));
@@ -188,8 +191,14 @@ impl Agent {
         let mut intent = match mode { Mode::Ask => Intent::Answer, Mode::Agent => Intent::Edit };
         let mut plan_note = String::new();
         if !map.is_empty() || !retrieved.is_empty() {
-            emit("planning: deciding which files to read".into());
-            match self.plan(llm, &map, &retrieved, prompt, mode).await {
+            let planned = match direct_answer_plan(&tools, &indexed_files, &root, prompt, mode, &budget) {
+                Some(plan) => {
+                    emit("planning skipped: named files fit in context (Ask mode)".into());
+                    Ok(plan)
+                }
+                None => self.plan(llm, &map, &retrieved, prompt, mode, &emit).await,
+            };
+            match planned {
                 Ok(plan) => {
                     if mode == Mode::Agent {
                         intent = plan.intent;
@@ -234,7 +243,11 @@ impl Agent {
                         });
                     }
                 }
-                Err(e) => emit(format!("planning step failed ({e}); using retrieval only")),
+                Err(e) => {
+                    // An unavailable intent classifier must never authorize writes.
+                    intent = Intent::Answer;
+                    emit(format!("planning step failed ({e}); answering read-only using retrieval"));
+                }
             }
         }
 
@@ -249,9 +262,11 @@ impl Agent {
 
         let result = match intent {
             Intent::Answer => {
-                emit("answering".into());
                 let user = format!("{preamble}<repo_context>\n{context}</repo_context>\n\nUSER REQUEST:\n{prompt}");
-                let answer = llm.chat_with_history(ANSWER_SYSTEM, &history, &user).await?;
+                let answer = with_progress(
+                    "answering", emit.as_ref(),
+                    llm.chat_with_history(ANSWER_SYSTEM, &history, &user),
+                ).await?;
                 AgentResult { answer, edited: vec![], failed: vec![], context_used: files_used }
             }
             Intent::Edit => {
@@ -295,7 +310,10 @@ impl Agent {
         let mut edited: Vec<EditedFile> = Vec::new();
 
         for attempt in 0..2 {
-            let reply = llm.chat_with_history(EDIT_SYSTEM, history, &user).await?;
+            let reply = with_progress(
+                "generating edits", emit.as_ref(),
+                llm.chat_with_history(EDIT_SYSTEM, history, &user),
+            ).await?;
             let blocks = edits::parse_blocks(&reply);
             let prose = edits::strip_blocks(&reply);
             if blocks.is_empty() {
@@ -401,6 +419,7 @@ impl Agent {
         edited
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn plan(
         &self,
         llm: &LlmClient,
@@ -408,6 +427,7 @@ impl Agent {
         retrieved: &[Retrieved],
         prompt: &str,
         mode: Mode,
+        emit: &Emit,
     ) -> Result<Plan> {
         let mut snippets = String::new();
         for r in retrieved.iter().take(12) {
@@ -419,7 +439,7 @@ impl Agent {
             Mode::Agent => "",
         };
         let user = format!(
-            "{mode_hint}PROJECT MAP:\n{map}\n\nRETRIEVED SNIPPETS:\n<repo_context>\n{snippets}</repo_context>\n\nUSER REQUEST:\n{prompt}"
+            "{mode_hint}<repo_context>\nPROJECT MAP:\n{map}\n\nRETRIEVED SNIPPETS:\n{snippets}</repo_context>\n\nUSER REQUEST:\n{prompt}"
         );
         let schema = serde_json::json!({
             "type": "object",
@@ -432,23 +452,8 @@ impl Agent {
             "required": ["intent", "files", "search", "reasoning"],
             "additionalProperties": false
         });
-        let v = llm.complete_json_lenient(PLAN_SYSTEM, &user, "plan", schema).await?;
-        let intent = match v["intent"].as_str() {
-            Some("edit") => Intent::Edit,
-            _ => Intent::Answer,
-        };
-        let strings = |key: &str| -> Vec<String> {
-            v[key]
-                .as_array()
-                .map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default()
-        };
-        Ok(Plan {
-            intent,
-            files: strings("files"),
-            search: strings("search"),
-            reasoning: v["reasoning"].as_str().unwrap_or("").to_string(),
-        })
+        let v = llm.complete_plan_json(PLAN_SYSTEM, &user, schema, emit.as_ref()).await?;
+        Ok(serde_json::from_value(v)?)
     }
 
     /// `path: sym, sym, …` for every indexed file, trimmed to `max_chars`.
@@ -510,14 +515,63 @@ impl Agent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Intent { Answer, Edit }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Plan {
     intent: Intent,
     files: Vec<String>,
     search: Vec<String>,
     reasoning: String,
+}
+
+/// Deterministic routing only for read-only requests with unambiguous indexed
+/// paths. Keep hybrid retrieval as well: related code may live in other files.
+/// Never bypass the planner if the named files would need truncation.
+fn direct_answer_plan(
+    tools: &ToolExecutor,
+    indexed_files: &[String],
+    root: &str,
+    prompt: &str,
+    mode: Mode,
+    budget: &Budget,
+) -> Option<Plan> {
+    if mode != Mode::Ask { return None; }
+    let prefix = crate::storage::root_prefix(root);
+    let files: Vec<&str> = indexed_files.iter()
+        .filter_map(|f| f.strip_prefix(&prefix)).collect();
+    let mut selected = Vec::new();
+    for token in prompt.split(|c: char| !c.is_alphanumeric() && !"/_.-".contains(c)) {
+        let token = token.trim_end_matches('.');
+        let token = token.strip_prefix(&prefix).unwrap_or(token);
+        let token = token.strip_prefix("./").unwrap_or(token);
+        if token.is_empty() { continue; }
+        let matches: Vec<&str> = files.iter().copied().filter(|f| {
+            *f == token || (!token.contains('/') && Path::new(f).file_name().and_then(|n| n.to_str()) == Some(token))
+        }).collect();
+        if matches.len() > 1 { return None; }
+        if let Some(file) = matches.first() {
+            if !selected.iter().any(|f| f == file) { selected.push(*file); }
+        }
+    }
+    if selected.is_empty() || selected.len() > 4 { return None; }
+    let mut used = 0;
+    for file in &selected {
+        let content = tools.read_file(file).ok()?;
+        if content.len() > budget.file_read_chars { return None; }
+        used += content.len() + file.len() + 128;
+    }
+    // Leave at least half the context budget for related retrieved snippets.
+    if used > budget.context_chars / 2 { return None; }
+    Some(Plan {
+        intent: Intent::Answer,
+        files: selected.into_iter().map(str::to_string).collect(),
+        search: vec![],
+        reasoning: "Read the explicitly named files and related retrieved context.".into(),
+    })
 }
 
 fn preamble(memory: &[String], map: &str, plan_note: &str) -> String {
@@ -551,4 +605,113 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Workspace {
+        root: std::path::PathBuf,
+        files: Vec<String>,
+    }
+
+    impl Workspace {
+        fn new(entries: &[(&str, &str)]) -> Self {
+            let root = std::env::temp_dir().join(format!("codebot_route_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut files = Vec::new();
+            for (file, content) in entries {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, content).unwrap();
+                files.push(path.to_string_lossy().into_owned());
+            }
+            Self { root, files }
+        }
+
+        fn plan(&self, prompt: &str, mode: Mode, budget: &Budget) -> Option<Plan> {
+            let root = self.root.to_str().unwrap();
+            direct_answer_plan(&ToolExecutor::new(root), &self.files, root, prompt, mode, budget)
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.root); }
+    }
+
+    fn budget() -> Budget {
+        Budget { context_chars: 24_000, map_chars: 6_000, history_chars: 6_000, file_read_chars: 8_000 }
+    }
+
+    #[test]
+    fn named_file_ask_skips_planning_with_exact_unique_paths() {
+        let ws = Workspace::new(&[("src/indexer.rs", "fn index_file() {}"), ("src/storage.rs", "struct Store;" )]);
+        for prompt in [
+            "Is `src/indexer.rs` fixed?",
+            "Check (./src/indexer.rs:71).",
+            "Explain indexer.rs.",
+            "看 src/indexer.rs？",
+        ] {
+            let plan = ws.plan(prompt, Mode::Ask, &budget()).unwrap();
+            assert_eq!(plan.intent, Intent::Answer);
+            assert_eq!(plan.files, ["src/indexer.rs"]);
+        }
+        let plan = ws.plan(&format!("Explain {}", ws.files[0]), Mode::Ask, &budget()).unwrap();
+        assert_eq!(plan.files, ["src/indexer.rs"]);
+        let plan = ws.plan("Compare src/indexer.rs with storage.rs and src/indexer.rs", Mode::Ask, &budget()).unwrap();
+        assert_eq!(plan.files, ["src/indexer.rs", "src/storage.rs"]);
+    }
+
+    #[test]
+    fn ambiguous_unmatched_and_agent_requests_still_need_planning() {
+        let ws = Workspace::new(&[("src/main.rs", "fn main() {}"), ("examples/main.rs", "fn main() {}")]);
+        for prompt in ["Explain main.rs", "Explain the project", "src/main.rs.bak", "other/src/main.rs", "../src/main.rs"] {
+            assert!(ws.plan(prompt, Mode::Ask, &budget()).is_none(), "{prompt}");
+        }
+        assert!(ws.plan("Change src/main.rs", Mode::Agent, &budget()).is_none());
+        assert!(ws.plan("Explain src/main.rs", Mode::Ask, &budget()).is_some());
+    }
+
+    #[test]
+    fn named_files_must_fit_and_be_readable() {
+        let ws = Workspace::new(&[("a.rs", "1234567890"), ("b.rs", "1234567890")]);
+        let mut small = budget();
+        small.file_read_chars = 9;
+        assert!(ws.plan("a.rs", Mode::Ask, &small).is_none());
+        small.file_read_chars = 10;
+        small.context_chars = 400;
+        assert!(ws.plan("a.rs b.rs", Mode::Ask, &small).is_none());
+        assert!(ws.plan("a.rs", Mode::Ask, &small).is_some());
+        std::fs::remove_file(&ws.files[0]).unwrap();
+        assert!(ws.plan("a.rs", Mode::Ask, &budget()).is_none());
+        let ws = Workspace::new(&[("a.rs", ""), ("b.rs", ""), ("c.rs", ""), ("d.rs", ""), ("e.rs", "")]);
+        assert!(ws.plan("a.rs b.rs c.rs d.rs e.rs", Mode::Ask, &budget()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_file_fast_path_preserves_symlink_sandbox() {
+        let ws = Workspace::new(&[("safe.rs", "")]);
+        let outside = Workspace::new(&[("outside.rs", "not workspace data")]);
+        std::fs::remove_file(&ws.files[0]).unwrap();
+        std::os::unix::fs::symlink(&outside.files[0], &ws.files[0]).unwrap();
+        assert!(ws.plan("safe.rs", Mode::Ask, &budget()).is_none());
+    }
+
+    #[test]
+    fn planner_shape_must_be_valid_before_authorizing_edits() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"intent": "edit"}),
+            serde_json::json!({"intent": "write", "files": [], "search": [], "reasoning": ""}),
+            serde_json::json!({"intent": "edit", "files": [42], "search": [], "reasoning": ""}),
+        ] {
+            assert!(serde_json::from_value::<Plan>(value).is_err());
+        }
+        let plan: Plan = serde_json::from_value(serde_json::json!({
+            "intent": "answer", "files": ["src/indexer.rs"], "search": [], "reasoning": "Verify ordering."
+        })).unwrap();
+        assert_eq!(plan.intent, Intent::Answer);
+    }
 }

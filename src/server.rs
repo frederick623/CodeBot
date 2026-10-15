@@ -65,7 +65,7 @@ fn configure_llm(store: &Store) -> LlmClient {
     let setting = |k: &str| store.get_setting(k).ok().flatten().filter(|v| !v.trim().is_empty());
     let llm_base = setting("llm_base")
         .or_else(|| std::env::var("CODEBOT_LLM_BASE").ok())
-        .unwrap_or_else(|| "http://localhost:8000".to_string());
+        .unwrap_or_else(|| "http://localhost:8080".to_string());
     let llm_model = setting("llm_model")
         .or_else(|| std::env::var("CODEBOT_LLM_MODEL").ok())
         .unwrap_or_else(|| "gpt-oss-20b-mxfp4-q8".to_string());

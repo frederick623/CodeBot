@@ -107,9 +107,16 @@ src/
 The core of the IDE. One turn runs as a *program-driven* loop so a small model only ever has to do one easy thing at a time:
 
 1. **Gather (program).** Recent memory notes, conversation history, a compact *project map* (every indexed file with the symbols it defines) and hybrid retrieval seeded by the prompt (symbols → one-hop call-graph neighbours → vector KNN → rerank).
-2. **Plan (model, JSON).** Decide `intent` (`answer` | `edit`), up to 4 files to read in full and up to 3 literal search terms. Falls back to retrieval only if the model cannot produce JSON.
+2. **Plan (bounded model call, JSON).** Decide `intent` (`answer` | `edit`), up to 4 files to read and up to 3 literal search terms. In **Ask mode**, explicit indexed paths (or unique basenames) bypass the model planner when all named files are readable and fit without truncation: at most 4 files, each within the file-read budget, together using at most half the context budget. Related hybrid retrieval is still included. Ambiguous paths, larger files and Agent mode retain model planning. A failed planner falls back to a **read-only answer** using retrieval, never automatic edits.
 3. **Answer or edit (model).** Ask mode answers in Markdown. Agent mode requests `SEARCH/REPLACE` blocks (never unified diffs, which weak models get wrong), applies them in memory, parse-checks the result with tree-sitter, and retries once with precise feedback plus the live file contents before writing to disk and re-indexing.
 4. **Remember (program).** The turn and a one-line memory note are persisted per workspace.
+
+#### Planning latency and progress
+
+- The agent's file-selection planner has a **45-second total deadline**, including any compatibility retry, and sends **`max_tokens: 1024`**. For model IDs containing `gpt-oss`, it also requests **`reasoning_effort: "low"`**; whether the server honors these options depends on the backend.
+- Strict JSON-schema output is tried first. Only an explicit unsupported `response_format`, `json_schema`, or `reasoning_effort` error (HTTP 400/422) permits one plain-chat fallback, without structured-output/reasoning options. The token cap and original deadline remain in force. Authentication, connection, rate-limit, server, timeout, malformed and truncated-output errors do not trigger a second planning call.
+- The GUI's existing step feed now receives start/end timing and **waiting updates every 5 seconds** for retrieval, planning, answering and edit generation. Planning reports model ID and input byte counts, and compatibility retries are visible. Waiting updates indicate elapsed time, not proof that the backend is generating tokens.
+- Final answers/edits retain the existing 600-second request timeout and non-streaming transport; these are status heartbeats, not token streaming. This planner deadline does not change the separate `/plan` interface-spec workflow. Cancelling a timed-out HTTP request stops the client waiting; stopping generation on the inference server depends on that server.
 
 #### `edits.rs`
 Parses `path` + `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks and applies them with three strategies — exact match, indentation-tolerant line match, then fuzzy match (similarity ≥ 0.88) — re-indenting the replacement to the matched block. Empty `SEARCH` creates a new file. CRLF endings are preserved.
@@ -127,9 +134,10 @@ Wraps `fastembed`'s `TextEmbedding` (BGE-Small-EN-V1.5) and `TextRerank` (BGE-Re
 - **Symbol graph**: extracts defined names, imported modules, and call sites; inserts them as nodes and typed edges (`import`, `call`) into the store for the symbol-lookup retrieval path.
 
 #### `llm.rs`
-Thin wrapper around the OpenAI `/v1/chat/completions` API. Provides two call modes:
+Thin wrapper around the OpenAI `/v1/chat/completions` API. Provides these call modes:
 - `chat()` — free-text completion (temperature 0.1).
 - `complete_json()` — structured output constrained by a JSON schema via `response_format` (temperature 0, deterministic).
+- `complete_plan_json()` — bounded file-selection planning with progress and a narrowly scoped compatibility fallback.
 
 #### `orchestrator.rs`
 Runs the two-phase code-generation workflow:
